@@ -66,6 +66,60 @@ describe('loadPluginConfig', () => {
     expect(config.autoUpdate).toBe(false);
   });
 
+  test('deep-merges webfetch settings across user and project configs', () => {
+    const userConfigPath = path.join(userConfigDir, 'opencode');
+    const projectDir = path.join(tempDir, 'project');
+    const projectConfigDir = path.join(projectDir, '.opencode');
+    fs.mkdirSync(userConfigPath, { recursive: true });
+    fs.mkdirSync(projectConfigDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(userConfigPath, 'oh-my-opencode-slim.json'),
+      JSON.stringify({
+        webfetch: { model: 'user/provider-model' },
+      }),
+    );
+    fs.writeFileSync(
+      path.join(projectConfigDir, 'oh-my-opencode-slim.json'),
+      JSON.stringify({
+        webfetch: { enabled: true },
+      }),
+    );
+
+    const config = loadPluginConfig(projectDir, { silent: true });
+
+    expect(config.webfetch).toEqual({
+      enabled: true,
+      model: 'user/provider-model',
+    });
+  });
+
+  test('does not let a defaulted project webfetch enabled override user false', () => {
+    const userConfigPath = path.join(userConfigDir, 'opencode');
+    const projectDir = path.join(tempDir, 'project');
+    const projectConfigDir = path.join(projectDir, '.opencode');
+    fs.mkdirSync(userConfigPath, { recursive: true });
+    fs.mkdirSync(projectConfigDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(userConfigPath, 'oh-my-opencode-slim.json'),
+      JSON.stringify({
+        webfetch: { enabled: false },
+      }),
+    );
+    fs.writeFileSync(
+      path.join(projectConfigDir, 'oh-my-opencode-slim.json'),
+      JSON.stringify({
+        webfetch: { model: 'project/provider-model' },
+      }),
+    );
+
+    const config = loadPluginConfig(projectDir, { silent: true });
+
+    expect(config.webfetch).toEqual({
+      enabled: false,
+      model: 'project/provider-model',
+    });
+  });
+
   test('validates auto image routing after project enables Observer', () => {
     const userConfigPath = path.join(userConfigDir, 'opencode');
     const projectDir = path.join(tempDir, 'project');
@@ -438,7 +492,7 @@ describe('onWarning callback', () => {
     expect(config.agents?.oracle?.model).toBe('valid/model');
   });
 
-  test('deprecated tmux key calls onWarning with invalid-schema and still loads', () => {
+  test('deprecated tmux key calls onWarning with deprecated-key and still loads', () => {
     const projectDir = path.join(tempDir, 'project');
     const projectConfigDir = path.join(projectDir, '.opencode');
     fs.mkdirSync(projectConfigDir, { recursive: true });
@@ -456,12 +510,12 @@ describe('onWarning callback', () => {
     });
 
     expect(warnings).toHaveLength(1);
-    expect(warnings[0]?.kind).toBe('invalid-schema');
+    expect(warnings[0]?.kind).toBe('deprecated-key');
     expect(warnings[0]?.message).toContain('Deprecated tmux config key');
     expect(config.agents?.oracle?.model).toBe('valid/model');
   });
 
-  test('deprecated council.master key calls onWarning with invalid-schema and still loads', () => {
+  test('deprecated council.master key calls onWarning with deprecated-key and still loads', () => {
     const projectDir = path.join(tempDir, 'project');
     const projectConfigDir = path.join(projectDir, '.opencode');
     fs.mkdirSync(projectConfigDir, { recursive: true });
@@ -485,7 +539,7 @@ describe('onWarning callback', () => {
     });
 
     expect(warnings).toHaveLength(1);
-    expect(warnings[0]?.kind).toBe('invalid-schema');
+    expect(warnings[0]?.kind).toBe('deprecated-key');
     expect(warnings[0]?.message).toContain(
       'Deprecated council.master config key',
     );
@@ -537,6 +591,93 @@ describe('onWarning callback', () => {
 
     const config = loadPluginConfig(projectDir);
     expect(config.agents?.oracle?.model).toBe('model');
+  });
+
+  test('rejects config with non-array disabled_tools (schema validation)', () => {
+    const projectDir = path.join(tempDir, 'project');
+    const projectConfigDir = path.join(projectDir, '.opencode');
+    fs.mkdirSync(projectConfigDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(projectConfigDir, 'oh-my-opencode-slim.json'),
+      JSON.stringify({
+        disabled_tools: 'not-an-array',
+        agents: { oracle: { model: 'test/model' } },
+      }),
+    );
+
+    const warnings: ConfigLoadWarning[] = [];
+    const config = loadPluginConfig(projectDir, {
+      onWarning: (warning) => warnings.push(warning),
+    });
+
+    // Schema validation rejects the entire file, so config is empty
+    expect(config).toEqual({});
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]?.kind).toBe('invalid-schema');
+    expect(warnings[0]?.message).toBe('Config does not match schema');
+  });
+
+  test('rejects config with non-array disabled_agents (schema validation)', () => {
+    const projectDir = path.join(tempDir, 'project');
+    const projectConfigDir = path.join(projectDir, '.opencode');
+    fs.mkdirSync(projectConfigDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(projectConfigDir, 'oh-my-opencode-slim.json'),
+      JSON.stringify({
+        disabled_agents: { invalid: 'object' },
+      }),
+    );
+
+    const warnings: ConfigLoadWarning[] = [];
+    const config = loadPluginConfig(projectDir, {
+      onWarning: (warning) => warnings.push(warning),
+    });
+
+    expect(config).toEqual({});
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]?.kind).toBe('invalid-schema');
+  });
+
+  test('rejects config with non-array disabled_mcps (schema validation)', () => {
+    const projectDir = path.join(tempDir, 'project');
+    const projectConfigDir = path.join(projectDir, '.opencode');
+    fs.mkdirSync(projectConfigDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(projectConfigDir, 'oh-my-opencode-slim.json'),
+      JSON.stringify({
+        disabled_mcps: 123,
+      }),
+    );
+
+    const warnings: ConfigLoadWarning[] = [];
+    const config = loadPluginConfig(projectDir, {
+      onWarning: (warning) => warnings.push(warning),
+    });
+
+    expect(config).toEqual({});
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]?.kind).toBe('invalid-schema');
+  });
+
+  test('rejects config with non-array disabled_skills (schema validation)', () => {
+    const projectDir = path.join(tempDir, 'project');
+    const projectConfigDir = path.join(projectDir, '.opencode');
+    fs.mkdirSync(projectConfigDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(projectConfigDir, 'oh-my-opencode-slim.json'),
+      JSON.stringify({
+        disabled_skills: true,
+      }),
+    );
+
+    const warnings: ConfigLoadWarning[] = [];
+    const config = loadPluginConfig(projectDir, {
+      onWarning: (warning) => warnings.push(warning),
+    });
+
+    expect(config).toEqual({});
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]?.kind).toBe('invalid-schema');
   });
 });
 
@@ -692,6 +833,39 @@ describe('deepMerge behavior', () => {
     const config = loadPluginConfig(projectDir);
     // Fallback deepMerge: project value wins over user value
     expect(config.fallback?.enabled).toBe(false);
+  });
+
+  test('deprecated fallback.* keys warn and still load', () => {
+    const userOpencodeDir = path.join(userConfigDir, 'opencode');
+    fs.mkdirSync(userOpencodeDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(userOpencodeDir, 'oh-my-opencode-slim.json'),
+      JSON.stringify({
+        fallback: {
+          enabled: true,
+          timeoutMs: 15000,
+          retryDelayMs: 500,
+          retry_on_empty: false,
+          runtimeOverride: true,
+        },
+        agents: { oracle: { model: 'valid/model' } },
+      }),
+    );
+
+    const warnings: ConfigLoadWarning[] = [];
+    const config = loadPluginConfig(userConfigDir, {
+      onWarning: (warning) => warnings.push(warning),
+    });
+
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]?.kind).toBe('deprecated-key');
+    expect(warnings[0]?.message).toContain('Deprecated fallback config keys');
+    expect(warnings[0]?.message).toContain('timeoutMs');
+    expect(config.fallback?.enabled).toBe(true);
+    // Removed fields must not survive into the parsed config
+    expect(config.fallback).not.toHaveProperty('timeoutMs');
+    expect(config.fallback).not.toHaveProperty('runtimeOverride');
+    expect(config.agents?.oracle?.model).toBe('valid/model');
   });
 });
 

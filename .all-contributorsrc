@@ -794,6 +794,60 @@
       "contributions": [
         "code"
       ]
+    },
+    {
+      "login": "major",
+      "name": "Major Hayden",
+      "avatar_url": "https://avatars.githubusercontent.com/u/89910?v=4",
+      "profile": "https://major.io/",
+      "contributions": [
+        "code"
+      ]
+    },
+    {
+      "login": "FrancoStino",
+      "name": "Davide Ladisa",
+      "avatar_url": "https://avatars.githubusercontent.com/u/32127923?v=4",
+      "profile": "https://github.com/FrancoStino",
+      "contributions": [
+        "code"
+      ]
+    },
+    {
+      "login": "Max-Null",
+      "name": "Max-Null",
+      "avatar_url": "https://avatars.githubusercontent.com/u/24647158?v=4",
+      "profile": "https://github.com/Max-Null",
+      "contributions": [
+        "code"
+      ]
+    },
+    {
+      "login": "brucemead",
+      "name": "Bruce",
+      "avatar_url": "https://avatars.githubusercontent.com/u/5895525?v=4",
+      "profile": "https://github.com/brucemead",
+      "contributions": [
+        "code"
+      ]
+    },
+    {
+      "login": "lih54767-coder",
+      "name": "zhaohaofan",
+      "avatar_url": "https://avatars.githubusercontent.com/u/271720354?v=4",
+      "profile": "https://github.com/lih54767-coder",
+      "contributions": [
+        "code"
+      ]
+    },
+    {
+      "login": "adevwithpurpose",
+      "name": "adevwithpurpose",
+      "avatar_url": "https://avatars.githubusercontent.com/u/197252873?v=4",
+      "profile": "https://github.com/adevwithpurpose",
+      "contributions": [
+        "code"
+      ]
     }
   ],
   "commitConvention": "angular"

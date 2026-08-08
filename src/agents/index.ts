@@ -15,6 +15,7 @@ import {
   SUBAGENT_NAMES,
 } from '../config';
 import { getAgentMcpList } from '../config/agent-mcps';
+import { escapeRegExp, normalizeAgentName } from '../utils/agent-variant';
 
 import { createCouncilAgent } from './council';
 import { buildCouncillorAgents, getCouncillorSeatName } from './council-agents';
@@ -42,11 +43,6 @@ type AgentFactory = (
 
 const CANCEL_TASK_ALLOWED_AGENTS = new Set(['orchestrator']);
 const SAFE_AGENT_ALIAS_RE = /^[a-z][a-z0-9_-]*$/i;
-
-function normalizeDisplayName(displayName: string): string {
-  const trimmed = displayName.trim();
-  return trimmed.startsWith('@') ? trimmed.slice(1) : trimmed;
-}
 
 function getPrimaryModelFromOverride(
   override: AgentOverrideConfig | undefined,
@@ -142,10 +138,6 @@ function isSafeDisplayName(displayName: string): boolean {
   return SAFE_AGENT_ALIAS_RE.test(displayName);
 }
 
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
 // Agent Configuration Helpers
 
 /**
@@ -197,6 +189,9 @@ function applyOverrides(
   if (override.displayName) {
     agent.displayName = override.displayName;
   }
+  if (override.description) {
+    agent.description = override.description;
+  }
   if (override.permission) {
     agent.config.permission = override.permission;
   }
@@ -235,15 +230,22 @@ function buildCustomAgentDefinition(
   const defaultPrompt = appendTaskRejectionInstruction(
     `You are the ${name} specialist.`,
   );
-  const basePrompt = override.prompt ?? defaultPrompt;
   const primaryModel = getPrimaryModelFromOverride(override);
+  const description = override.description ?? `Custom subagent '${name}'`;
 
   return {
     name,
+    description,
     config: {
       model: primaryModel ?? DEFAULT_MODELS.oracle,
       temperature: 0.2,
-      prompt: resolvePrompt(basePrompt, filePrompt, fileAppendPrompt),
+      prompt: resolvePrompt(
+        name,
+        override.prompt,
+        filePrompt,
+        defaultPrompt,
+        fileAppendPrompt,
+      ),
     },
   } as AgentDefinition;
 }
@@ -259,7 +261,7 @@ function injectDisplayNames(
   for (const [internalName, displayName] of nameMap) {
     prompt = prompt.replace(
       new RegExp(`@${escapeRegExp(internalName)}\\b`, 'g'),
-      `@${normalizeDisplayName(displayName)}`,
+      `@${normalizeAgentName(displayName)}`,
     );
   }
 
@@ -401,11 +403,11 @@ export function createAgents(
         agent.config.prompt ?? '',
       );
 
-      const basePrompt =
-        inlinePrompt !== undefined ? inlinePrompt : defaultPrompt;
       agent.config.prompt = resolvePrompt(
-        basePrompt,
+        name,
+        inlinePrompt,
         customPrompts.prompt,
+        defaultPrompt,
         customPrompts.appendPrompt,
       );
 
@@ -541,19 +543,20 @@ export function createAgents(
     undefined,
     disabled,
     councillorAgents.length > 0 ? ['council'] : undefined,
-    !config?.disabled_tools?.includes('wait_for_user'),
+    !(
+      Array.isArray(config?.disabled_tools) &&
+      config.disabled_tools.includes('wait_for_user')
+    ),
   );
 
   const inlineOrchestratorPrompt = orchestratorOverride?.prompt;
   const defaultOrchestratorPrompt = orchestrator.config.prompt ?? '';
 
-  const baseOrchestratorPrompt =
-    inlineOrchestratorPrompt !== undefined
-      ? inlineOrchestratorPrompt
-      : defaultOrchestratorPrompt;
   orchestrator.config.prompt = resolvePrompt(
-    baseOrchestratorPrompt,
+    'orchestrator',
+    inlineOrchestratorPrompt,
     orchestratorPrompts.prompt,
+    defaultOrchestratorPrompt,
     orchestratorPrompts.appendPrompt,
   );
 
@@ -603,7 +606,7 @@ export function createAgents(
   // Validate display names
   const usedDisplayNames = new Set<string>();
   for (const [, displayName] of displayNameMap) {
-    const normalizedDisplayName = normalizeDisplayName(displayName);
+    const normalizedDisplayName = normalizeAgentName(displayName);
     if (!isSafeDisplayName(normalizedDisplayName)) {
       throw new Error(
         `displayName '${normalizedDisplayName}' must match /^[a-z][a-z0-9_-]*$/i`,
@@ -636,7 +639,7 @@ export function createAgents(
     for (const [internalName, displayName] of displayNameMap) {
       text = text.replace(
         new RegExp(`@${escapeRegExp(internalName)}\\b`, 'g'),
-        `@${normalizeDisplayName(displayName)}`,
+        `@${normalizeAgentName(displayName)}`,
       );
     }
     return text;
@@ -736,7 +739,7 @@ export function getAgentConfigs(
     applyClassification(a.name, sdkConfig);
 
     const normalizedDisplayName = a.displayName
-      ? normalizeDisplayName(a.displayName)
+      ? normalizeAgentName(a.displayName)
       : undefined;
 
     if (normalizedDisplayName && !isInternalOnly(a.name)) {
@@ -756,8 +759,9 @@ export function getAgentConfigs(
  */
 export function getDisabledAgents(config?: PluginConfig): Set<string> {
   const userDisabled = config?.disabled_agents;
-  const disabledSource =
-    userDisabled !== undefined ? userDisabled : DEFAULT_DISABLED_AGENTS;
+  const disabledSource = Array.isArray(userDisabled)
+    ? userDisabled
+    : DEFAULT_DISABLED_AGENTS;
   const disabled = new Set<string>();
   for (const name of disabledSource) {
     if (!PROTECTED_AGENTS.has(name)) {

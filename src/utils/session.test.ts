@@ -34,10 +34,10 @@ describe('session utilities', () => {
     } as any;
 
     await expect(
-      promptWithTimeout(client, { path: { id: 's1' }, body: { parts: [] } }, 5),
+      promptWithTimeout(client, { sessionID: 's1', parts: [] }, 5),
     ).rejects.toThrow('Prompt timed out after 5ms');
 
-    expect(abort).toHaveBeenCalledWith({ path: { id: 's1' } });
+    expect(abort).toHaveBeenCalledWith({ sessionID: 's1' });
   });
 
   test('promptWithTimeout preserves timeout error when abort fails', async () => {
@@ -53,12 +53,12 @@ describe('session utilities', () => {
     } as any;
 
     await expect(
-      promptWithTimeout(client, { path: { id: 's1' }, body: { parts: [] } }, 5),
+      promptWithTimeout(client, { sessionID: 's1', parts: [] }, 5),
     ).rejects.toThrow('Prompt timed out after 5ms');
 
     // Abort must still be attempted even though it threw; the original
     // timeout error is preserved.
-    expect(abort).toHaveBeenCalledWith({ path: { id: 's1' } });
+    expect(abort).toHaveBeenCalledWith({ sessionID: 's1' });
   });
 
   test('promptWithTimeout honors abort signal when timeout is disabled', async () => {
@@ -77,7 +77,7 @@ describe('session utilities', () => {
     await expect(
       promptWithTimeout(
         client,
-        { path: { id: 's1' }, body: { parts: [] } },
+        { sessionID: 's1', parts: [] },
         0,
         controller.signal,
       ),
@@ -86,7 +86,7 @@ describe('session utilities', () => {
     // Signal cancel must abort the server-side session, same as timeout.
     // Without this, the parent tool returns cancelled while the child keeps
     // running (orphan session).
-    expect(abort).toHaveBeenCalledWith({ path: { id: 's1' } });
+    expect(abort).toHaveBeenCalledWith({ sessionID: 's1' });
   });
 
   test('promptWithTimeout returns when prompt resolves with no timeout', async () => {
@@ -100,7 +100,7 @@ describe('session utilities', () => {
     } as any;
 
     await expect(
-      promptWithTimeout(client, { path: { id: 's1' }, body: { parts: [] } }, 0),
+      promptWithTimeout(client, { sessionID: 's1', parts: [] }, 0),
     ).resolves.toBeUndefined();
   });
 
@@ -114,5 +114,46 @@ describe('session utilities', () => {
     await expect(abortSessionWithTimeout(client, 's1', 5)).rejects.toThrow(
       'Session abort timed out after 5ms',
     );
+  });
+
+  test('promptWithTimeout handles late prompt rejection without unhandled rejection', async () => {
+    let deferredReject: ((error: Error) => void) | undefined;
+    const prompt = mock(
+      () =>
+        new Promise<never>((_resolve, reject) => {
+          deferredReject = reject;
+        }),
+    );
+    const abort = mock(async () => ({}));
+    const client = {
+      session: { abort, prompt },
+    } as any;
+
+    let unhandledRejection: Error | null = null;
+    const handler = (err: Error) => {
+      unhandledRejection = err;
+    };
+    process.on('unhandledRejection', handler);
+    try {
+      await expect(
+        promptWithTimeout(client, { sessionID: 's1', parts: [] }, 5),
+      ).rejects.toThrow('Prompt timed out after 5ms');
+
+      // Timeout behavior is unchanged — abort is called
+      expect(abort).toHaveBeenCalledWith({ sessionID: 's1' });
+
+      // Simulate a late provider response arriving after timeout
+      if (deferredReject) {
+        deferredReject(new Error('provider error after timeout'));
+      }
+
+      // Yield to the microtask queue so the catch handler runs
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+      // No unhandled rejection should surface
+      expect(unhandledRejection).toBeNull();
+    } finally {
+      process.off('unhandledRejection', handler);
+    }
   });
 });

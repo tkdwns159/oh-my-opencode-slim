@@ -3,7 +3,12 @@ import * as path from 'node:path';
 import { stripJsonComments } from '../cli/config-io';
 import { getConfigSearchDirs } from '../cli/paths';
 import { DEFAULT_DISABLED_AGENTS } from './constants';
-import { type PluginConfig, PluginConfigSchema } from './schema';
+import {
+  LEGACY_FALLBACK_KEYS,
+  type PluginConfig,
+  PluginConfigSchema,
+  WebfetchConfigSchema,
+} from './schema';
 
 /**
  * Warning kinds produced during config loading.
@@ -12,7 +17,8 @@ export type ConfigLoadWarningKind =
   | 'invalid-json'
   | 'invalid-schema'
   | 'read-error'
-  | 'missing-preset';
+  | 'missing-preset'
+  | 'deprecated-key';
 
 /**
  * A warning emitted while loading plugin configuration.
@@ -93,7 +99,7 @@ function loadConfigFromPath(
         'Deprecated tmux config key found and ignored. Use multiplexer config instead.';
       options?.onWarning?.({
         path: configPath,
-        kind: 'invalid-schema' as ConfigLoadWarningKind,
+        kind: 'deprecated-key',
         message: tmuxMsg,
       });
       if (!options?.silent) {
@@ -117,11 +123,36 @@ function loadConfigFromPath(
         'Deprecated council.master config key found and ignored. Configure council agents via presets instead.';
       options?.onWarning?.({
         path: configPath,
-        kind: 'invalid-schema' as ConfigLoadWarningKind,
+        kind: 'deprecated-key',
         message: masterMsg,
       });
       if (!options?.silent) {
         console.warn(`[oh-my-opencode-slim] ${masterMsg}`);
+      }
+    }
+
+    // Warn about deprecated fallback.* keys. The schema strips these before
+    // validation so the rest of the config still loads; without this warning
+    // users would not know their stale keys are ignored.
+    if (
+      typeof rawConfig === 'object' &&
+      rawConfig !== null &&
+      typeof (rawConfig as Record<string, unknown>).fallback === 'object' &&
+      (rawConfig as Record<string, unknown>).fallback !== null
+    ) {
+      const fallback = (rawConfig as Record<string, unknown>)
+        .fallback as Record<string, unknown>;
+      const present = LEGACY_FALLBACK_KEYS.filter((key) => key in fallback);
+      if (present.length > 0) {
+        const fallbackMsg = `Deprecated fallback config key${present.length === 1 ? '' : 's'} ${present.join(', ')} found and ignored. These fields were removed in 2.3.x; fallback behavior is controlled by fallback.enabled and fallback.maxRetries.`;
+        options?.onWarning?.({
+          path: configPath,
+          kind: 'deprecated-key',
+          message: fallbackMsg,
+        });
+        if (!options?.silent) {
+          console.warn(`[oh-my-opencode-slim] ${fallbackMsg}`);
+        }
       }
     }
 
@@ -139,6 +170,26 @@ function loadConfigFromPath(
         console.warn(result.error.format());
       }
       return null;
+    }
+
+    // Zod applies webfetch.enabled's default while parsing each layer. Keep
+    // that default from masquerading as an explicitly configured override;
+    // the merged webfetch config is normalized after all layers are merged.
+    if (
+      result.data.webfetch &&
+      typeof rawConfig === 'object' &&
+      rawConfig !== null &&
+      'webfetch' in rawConfig &&
+      typeof rawConfig.webfetch === 'object' &&
+      rawConfig.webfetch !== null &&
+      !Array.isArray(rawConfig.webfetch) &&
+      !Object.hasOwn(rawConfig.webfetch, 'enabled')
+    ) {
+      const { enabled: _enabled, ...webfetch } = result.data.webfetch;
+      return {
+        ...result.data,
+        webfetch: webfetch as PluginConfig['webfetch'],
+      };
     }
 
     return result.data;
@@ -200,6 +251,17 @@ function findConfigPathInDirs(
   return null;
 }
 
+/**
+ * Validate that `image_routing: "auto"` has a live observer agent to route
+ * images to. Emits a warning (via `onWarning`/`console.warn`) and returns
+ * `false` if "auto" routing is configured but the observer agent is
+ * disabled, since images would then have nowhere to go.
+ *
+ * @param config - Plugin configuration to validate
+ * @param configPath - Path of the config file, used in the warning payload
+ * @param options - Optional load options including the onWarning callback
+ * @returns `true` if the routing configuration is valid, `false` otherwise
+ */
 function validateFinalImageRouting(
   config: PluginConfig,
   configPath: string,
@@ -207,7 +269,9 @@ function validateFinalImageRouting(
 ): boolean {
   if (config.image_routing !== 'auto') return true;
 
-  const disabledAgents = config.disabled_agents ?? DEFAULT_DISABLED_AGENTS;
+  const disabledAgents = Array.isArray(config.disabled_agents)
+    ? config.disabled_agents
+    : DEFAULT_DISABLED_AGENTS;
   if (!disabledAgents.includes('observer')) return true;
 
   const message =
@@ -266,10 +330,13 @@ export function mergePluginConfigs(
     agents: deepMerge(base.agents, override.agents),
     presets: deepMerge(base.presets, override.presets),
     multiplexer: deepMerge(base.multiplexer, override.multiplexer),
-    interview: deepMerge(base.interview, override.interview),
     backgroundJobs: deepMerge(base.backgroundJobs, override.backgroundJobs),
     fallback: deepMerge(base.fallback, override.fallback),
     council: deepMerge(base.council, override.council),
+    webfetch: deepMerge(
+      base.webfetch as Record<string, unknown> | undefined,
+      override.webfetch as Record<string, unknown> | undefined,
+    ) as PluginConfig['webfetch'],
     acpAgents: deepMerge(base.acpAgents, override.acpAgents),
     companion: deepMerge(
       base.companion as Record<string, unknown> | undefined,
@@ -351,6 +418,10 @@ export function loadPluginConfig(
     config = mergePluginConfigs(config, projectConfig);
   }
 
+  if (config.webfetch) {
+    config.webfetch = WebfetchConfigSchema.parse(config.webfetch);
+  }
+
   // Override preset from environment variable if set
   const envPreset = process.env.OH_MY_OPENCODE_SLIM_PRESET;
   if (envPreset) {
@@ -401,6 +472,44 @@ export function loadPluginConfig(
     projectConfigPath ?? userConfigPath ?? '',
     options,
   );
+  // Note: we intentionally do NOT override image_routing to 'direct' here.
+  // The observer-disabled guard in processImageAttachments handles the
+  // auto+observer-disabled case by returning true, which triggers the
+  // debounced toast in index.ts. Overriding to 'direct' here would prevent
+  // processImageAttachments from returning true and suppress the toast.
+
+  // Normalize disabled_* config keys to ensure they are arrays or undefined.
+  // This loop is currently unreachable via the normal file-loading path:
+  // PluginConfigSchema.safeParse() rejects the WHOLE config object if any
+  // disabled_* field is non-array (no .catch() on these fields), so
+  // loadConfigFromPath returns null and the file falls back to {} BEFORE this
+  // loop ever runs. Retained only as defense-in-depth against a future schema
+  // relaxation (e.g. adding .catch() to these fields) or a construction path
+  // that bypasses safeParse entirely — not as a proven/tested fix for the
+  // originally reported crash (root cause not reproduced).
+  const ARRAY_CONFIG_KEYS = [
+    'disabled_agents',
+    'disabled_tools',
+    'disabled_mcps',
+    'disabled_skills',
+  ] as const;
+
+  const configPathForWarning = projectConfigPath ?? userConfigPath ?? '';
+  for (const key of ARRAY_CONFIG_KEYS) {
+    const value = config[key as keyof PluginConfig];
+    if (value !== undefined && !Array.isArray(value)) {
+      const message = `Config key "${key}" must be an array; ignoring invalid value.`;
+      options?.onWarning?.({
+        path: configPathForWarning,
+        kind: 'invalid-schema',
+        message,
+      });
+      if (!options?.silent) {
+        console.warn(`[oh-my-opencode-slim] ${message}`);
+      }
+      delete config[key as keyof PluginConfig];
+    }
+  }
 
   return config;
 }

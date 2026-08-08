@@ -2,11 +2,12 @@
  * Shared session utilities for council and background managers.
  */
 
-import type { PluginInput } from '@opencode-ai/plugin';
-
-type OpencodeClient = PluginInput['client'];
+import type { OpencodeClient } from '@opencode-ai/sdk/v2';
+import { log } from './logger';
 
 export const SESSION_ABORT_TIMEOUT_MS = 1_000;
+
+export const SESSION_ID_PATTERN = /^ses_[A-Za-z0-9_-]+$/;
 
 export class OperationTimeoutError extends Error {
   constructor(message: string) {
@@ -43,30 +44,11 @@ export async function abortSessionWithTimeout(
   timeoutMs = SESSION_ABORT_TIMEOUT_MS,
 ): Promise<void> {
   await withTimeout(
-    client.session.abort({ path: { id: sessionId } }),
+    client.session.abort({ sessionID: sessionId }),
     timeoutMs,
     `Session abort timed out after ${timeoutMs}ms`,
   );
 }
-
-/**
- * Extract the short model label from a "provider/model" string.
- * E.g. "openai/gpt-5.6-luna" → "gpt-5.6-luna"
- */
-export function shortModelLabel(model: string): string {
-  return model.split('/').pop() ?? model;
-}
-
-export type PromptBody = {
-  messageID?: string;
-  model?: { providerID: string; modelID: string };
-  agent?: string;
-  noReply?: boolean;
-  system?: string;
-  tools?: { [key: string]: boolean };
-  parts: Array<{ type: 'text'; text: string }>;
-  variant?: string;
-};
 
 /**
  * Parse a model reference string into provider and model IDs.
@@ -102,14 +84,19 @@ export async function promptWithTimeout(
 ): Promise<void> {
   if (signal?.aborted) throw new Error('Prompt cancelled');
 
-  const sessionId = args.path.id;
+  const sessionId = args.sessionID;
   const hasTimeout = timeoutMs > 0;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let onAbort: (() => void) | undefined;
 
   try {
     const promptPromise = client.session.prompt(args);
-    promptPromise.catch(() => {});
+    promptPromise.catch((error) => {
+      log('[session] suppressed prompt rejection (race loser)', {
+        sessionId,
+        error: String(error),
+      });
+    });
 
     const racers: Array<Promise<unknown>> = [promptPromise];
 
@@ -195,8 +182,8 @@ export async function extractSessionResult(
   const includeReasoning = options?.includeReasoning ?? true;
 
   const messagesResult = await client.session.messages({
-    path: { id: sessionId },
-    ...(options?.directory ? { query: { directory: options.directory } } : {}),
+    sessionID: sessionId,
+    ...(options?.directory ? { directory: options.directory } : {}),
   });
   const messages = (messagesResult.data ?? []) as Array<{
     info?: { role: string };

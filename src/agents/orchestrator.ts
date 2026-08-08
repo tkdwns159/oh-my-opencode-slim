@@ -11,16 +11,26 @@ export interface AgentDefinition {
 }
 
 /**
- * Resolve agent prompt from base/custom/append inputs.
- * If customPrompt is provided, it replaces the base entirely.
- * If customAppendPrompt is provided, it appends after whichever base won.
+ * Resolve agent prompt from inline/file/append inputs.
+ *
+ * Precedence: inline prompt > file prompt > fallback. An explicit inline
+ * `override.prompt` wins over a `<agent>.md` file; the file is the
+ * shared default. `customAppendPrompt` always appends after whichever base
+ * won. Deterministic per session (construction-time only) — cache-safe.
  */
 export function resolvePrompt(
-  base: string,
-  customPrompt?: string,
+  agentName: string,
+  inlinePrompt: string | undefined,
+  filePrompt: string | undefined,
+  fallback: string,
   customAppendPrompt?: string,
 ): string {
-  const effectiveBase = customPrompt !== undefined ? customPrompt : base;
+  if (inlinePrompt !== undefined && filePrompt !== undefined) {
+    console.warn(
+      `[oh-my-opencode] Agent '${agentName}': inline prompt overrides prompt file (${agentName}.md). Remove the inline prompt to use the file.`,
+    );
+  }
+  const effectiveBase = inlinePrompt ?? filePrompt ?? fallback;
   return customAppendPrompt !== undefined
     ? `${effectiveBase}\n\n${customAppendPrompt}`
     : effectiveBase;
@@ -186,12 +196,14 @@ Review available agents and lane rules. Before beginning non-trivial work, ident
 
 ${WRITABLE_FILE_OPERATIONS_RULES}
 
+### Delegation Contract
+- Every delegation names a validation owner and allowed scope.
+
 ## 4. Plan and Parallelize
 When the routing threshold calls for delegation, build a short work graph before dispatching:
 - Independent lanes that can run now
 - Dependency-ordered lanes that must wait
 - Advisory ownership for write-capable lanes
-- Verification/review lanes that run after implementation
 
 ### Todo Continuity
 - When the user adds a new task while a todo list exists, append the new task to the end of the existing todo list instead of replacing the list.
@@ -237,13 +249,9 @@ Balance: respect dependencies, avoid parallelizing what must be sequential, and 
 - Do not leave \`task_id\` empty when intending to reuse; omitted or empty \`task_id\` creates a new specialist session.
 
 ## 6. Verify
-- Define the observable success criteria from the user's request.
-- Choose the minimum verification that produces meaningful evidence for the change's scope, risk, uncertainty, and potential impact.
-- Start with the narrowest relevant validation. Broaden verification only when integration scope, uncertainty, risk, or a failed focused check justifies it.
-- Do not run project-wide checks by habit or merely because files changed.
-- Do not treat verification as a fixed checklist; select evidence that can actually confirm the requested behavior.
-- Request independent review only when its expected risk reduction justifies its coordination cost.
-- Report what was verified and any material remaining uncertainty.
+- Reconcile all writer lanes before final validation.
+- Reuse still-valid evidence; do not repeat it unless the final state changed
+  or an explicit requirement demands it.
 
 </Workflow>
 
@@ -298,7 +306,13 @@ export function createOrchestratorAgent(
     excludeDescriptions,
     waitForUserEnabled,
   );
-  const prompt = resolvePrompt(basePrompt, customPrompt, customAppendPrompt);
+  const prompt = resolvePrompt(
+    'orchestrator',
+    undefined,
+    customPrompt,
+    basePrompt,
+    customAppendPrompt,
+  );
 
   const definition: AgentDefinition = {
     name: 'orchestrator',
