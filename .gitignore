@@ -50,6 +50,7 @@ oh-my-opencode
 opencode.jsonc
 
 # AI Memory
+.serena/
 .aim/
 
 # Planning docs (not for commit)
