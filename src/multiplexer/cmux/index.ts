@@ -40,6 +40,14 @@ export interface CmuxIdentity {
   socketPath: string;
 }
 
+export interface CmuxNotificationInput {
+  title: string;
+  body?: string;
+  subtitle?: string;
+  workspaceId?: string;
+  surfaceId?: string;
+}
+
 export interface CmuxClient {
   version(): Promise<string | null>;
   getVersionError?(): 'unavailable' | 'hard';
@@ -71,6 +79,14 @@ export interface CmuxClient {
       workspace_id: string;
       orientation: 'vertical';
     },
+    socketPath?: string,
+  ): Promise<boolean>;
+  notify(
+    notification: CmuxNotificationInput,
+    socketPath?: string,
+  ): Promise<boolean>;
+  triggerFlash(
+    params?: { workspaceId?: string; surfaceId?: string },
     socketPath?: string,
   ): Promise<boolean>;
 }
@@ -303,6 +319,37 @@ export class CmuxMultiplexer implements Multiplexer {
     _mainPaneSize: number,
   ): Promise<void> {
     // cmux layout is maintained by spawnPane and closePane.
+  }
+
+  async notifyAlarm(title: string, body?: string): Promise<boolean> {
+    let socketPath: string | undefined;
+    let workspaceId: string | undefined;
+    let surfaceId: string | undefined;
+
+    const root = await this.client.identify().catch(() => null);
+    if (root) {
+      socketPath = root.socketPath;
+      workspaceId = root.workspaceId;
+      surfaceId = root.surfaceId;
+    }
+
+    await this.client
+      .triggerFlash({ workspaceId, surfaceId }, socketPath)
+      .catch(() => false);
+
+    const success = await this.client
+      .notify({ title, body, workspaceId, surfaceId }, socketPath)
+      .catch(() => false);
+
+    if (typeof process !== 'undefined' && process.stdout?.write) {
+      try {
+        process.stdout.write('\x07');
+      } catch {
+        // ignore stdout write errors
+      }
+    }
+
+    return success;
   }
 
   private async cleanupPane(
@@ -604,6 +651,42 @@ export class CliCmuxClient implements CmuxClient {
     return result?.exitCode === 0;
   }
 
+  async notify(
+    notification: CmuxNotificationInput,
+    socketPath?: string,
+  ): Promise<boolean> {
+    const args: string[] = ['notify', '--title', notification.title];
+    if (notification.subtitle) {
+      args.push('--subtitle', notification.subtitle);
+    }
+    if (notification.body) {
+      args.push('--body', notification.body);
+    }
+    if (notification.workspaceId) {
+      args.push('--workspace', notification.workspaceId);
+    }
+    if (notification.surfaceId) {
+      args.push('--surface', notification.surfaceId);
+    }
+    const result = await this.run(withSocket(socketPath, args));
+    return result?.exitCode === 0;
+  }
+
+  async triggerFlash(
+    params?: { workspaceId?: string; surfaceId?: string },
+    socketPath?: string,
+  ): Promise<boolean> {
+    const args: string[] = ['trigger-flash'];
+    if (params?.workspaceId) {
+      args.push('--workspace', params.workspaceId);
+    }
+    if (params?.surfaceId) {
+      args.push('--surface', params.surfaceId);
+    }
+    const result = await this.run(withSocket(socketPath, args));
+    return result?.exitCode === 0;
+  }
+
   private async run(args: string[]): Promise<CommandResult | null> {
     this.lastRunThrew = false;
     this.binary ??= await findBinary('cmux');
@@ -689,6 +772,8 @@ function commandOperation(args: string[]): string {
         'respawn-pane',
         'close-surface',
         'rpc',
+        'notify',
+        'trigger-flash',
       ].includes(arg),
     ) ?? 'version'
   );

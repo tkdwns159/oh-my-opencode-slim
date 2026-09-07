@@ -817,6 +817,13 @@ export class MultiplexerSessionManager {
   async cleanupOnInstanceDisposed(): Promise<void> {
     if (this.cmuxLifecycle) await this.cmuxLifecycle.cleanup();
   }
+
+  async notifyAlarm(title: string, body?: string): Promise<boolean> {
+    if (this.enabled && this.multiplexer?.notifyAlarm) {
+      return await this.multiplexer.notifyAlarm(title, body);
+    }
+    return false;
+  }
 }
 
 /**

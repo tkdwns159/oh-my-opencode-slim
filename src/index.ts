@@ -465,8 +465,13 @@ const OhMyOpenCodeLite: Plugin = async (ctx) => {
       registerSessionAsOrchestrator: (sessionID) => {
         sessionMetadata.setAgent(sessionID, 'orchestrator');
       },
-      beginUserWait: (sessionID) =>
-        taskSessionManagerHook.beginUserWait(sessionID),
+      beginUserWait: (sessionID) => {
+        taskSessionManagerHook.beginUserWait(sessionID);
+        void multiplexerSessionManager.notifyAlarm(
+          'OpenCode Waiting for User',
+          'OpenCode is paused awaiting user action.',
+        );
+      },
     });
 
     const shouldRegisterWebfetch = config.webfetch?.enabled !== false;
@@ -974,7 +979,19 @@ const OhMyOpenCodeLite: Plugin = async (ctx) => {
           (event.type === 'session.status' && statusType === 'idle') ||
           event.type === 'session.deleted'
         ) {
+          const wasActive =
+            sessionMetadata.isOrchestratorActive(eventSessionID);
           sessionMetadata.markOrchestratorIdle(eventSessionID);
+          if (
+            wasActive &&
+            sessionMetadata.getAgent(eventSessionID) === 'orchestrator' &&
+            event.type !== 'session.deleted'
+          ) {
+            void multiplexerSessionManager.notifyAlarm(
+              'OpenCode Task Completed',
+              'OpenCode is idle and awaiting your next command.',
+            );
+          }
         }
       }
 
@@ -1051,6 +1068,22 @@ const OhMyOpenCodeLite: Plugin = async (ctx) => {
         event.type === 'question.asked'
       ) {
         companionManager.onWaitingInput();
+        const title =
+          event.type === 'permission.asked'
+            ? 'OpenCode Permission Requested'
+            : 'OpenCode Question Asked';
+        const body =
+          event.type === 'permission.asked'
+            ? 'OpenCode requires your permission to proceed.'
+            : 'OpenCode is asking a question.';
+        void multiplexerSessionManager.notifyAlarm(title, body);
+      }
+
+      if (event.type === 'session.error') {
+        void multiplexerSessionManager.notifyAlarm(
+          'OpenCode Session Error',
+          'An error occurred in OpenCode session.',
+        );
       }
 
       if (

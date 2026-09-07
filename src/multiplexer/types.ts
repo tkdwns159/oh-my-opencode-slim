@@ -59,6 +59,13 @@ export interface Multiplexer {
    * @param mainPaneSize - Percentage for main pane (for main-* layouts)
    */
   applyLayout(layout: MultiplexerLayout, mainPaneSize: number): Promise<void>;
+
+  /**
+   * Send notification or alarm through multiplexer
+   * @param title - Notification title
+   * @param body - Optional notification body
+   */
+  notifyAlarm?(title: string, body?: string): Promise<boolean>;
 }
 
 /**

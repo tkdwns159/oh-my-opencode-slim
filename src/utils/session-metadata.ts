@@ -51,6 +51,10 @@ export class SessionMetadataStore {
     this.#activeOrchestratorSessionIDs.delete(sessionID);
   }
 
+  isOrchestratorActive(sessionID: string): boolean {
+    return this.#activeOrchestratorSessionIDs.has(sessionID);
+  }
+
   delete(sessionID: string): void {
     this.#agents.delete(sessionID);
     this.#directories.delete(sessionID);

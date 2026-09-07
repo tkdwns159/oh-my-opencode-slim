@@ -25,6 +25,8 @@ function client(): CmuxClient {
     respawnSurface: mock(async () => true),
     closeSurface: mock(async () => 'closed' as const),
     equalizeSplits: mock(async () => true),
+    notify: mock(async () => true),
+    triggerFlash: mock(async () => true),
   };
 }
 
@@ -537,6 +539,79 @@ describe('CliCmuxClient', () => {
     expect(cli.getCreateError()).toBe('unavailable');
     expect(await cli.version()).toBe('0.64.17');
     expect(await cli.identify()).not.toBeNull();
+  });
+
+  test('triggers alarm via notify and triggerFlash with identified socket', async () => {
+    const api = client();
+    const instance = mux(api);
+    const success = await instance.notifyAlarm(
+      'Attention',
+      'Check task status',
+    );
+    expect(success).toBe(true);
+    expect(api.triggerFlash).toHaveBeenCalledWith(
+      { workspaceId: 'workspace-root', surfaceId: 'surface-root' },
+      '/tmp/cmux.sock',
+    );
+    expect(api.notify).toHaveBeenCalledWith(
+      {
+        title: 'Attention',
+        body: 'Check task status',
+        workspaceId: 'workspace-root',
+        surfaceId: 'surface-root',
+      },
+      '/tmp/cmux.sock',
+    );
+  });
+
+  test('CliCmuxClient executes notify and trigger-flash with correct args', async () => {
+    const runnerCalls: string[][] = [];
+    const runner: CommandRunner = {
+      run: mock(async (argv) => {
+        runnerCalls.push(argv);
+        return { exitCode: 0, stdout: 'OK', stderr: '' };
+      }),
+    };
+    const cli = new CliCmuxClient(runner, '/bin/cmux');
+    expect(
+      await cli.notify(
+        { title: 'Title', body: 'Body', workspaceId: 'w1', surfaceId: 's1' },
+        '/tmp/socket.sock',
+      ),
+    ).toBe(true);
+    expect(
+      await cli.triggerFlash(
+        { workspaceId: 'w1', surfaceId: 's1' },
+        '/tmp/socket.sock',
+      ),
+    ).toBe(true);
+
+    expect(runnerCalls).toEqual([
+      [
+        '/bin/cmux',
+        '--socket',
+        '/tmp/socket.sock',
+        'notify',
+        '--title',
+        'Title',
+        '--body',
+        'Body',
+        '--workspace',
+        'w1',
+        '--surface',
+        's1',
+      ],
+      [
+        '/bin/cmux',
+        '--socket',
+        '/tmp/socket.sock',
+        'trigger-flash',
+        '--workspace',
+        'w1',
+        '--surface',
+        's1',
+      ],
+    ]);
   });
 });
 
