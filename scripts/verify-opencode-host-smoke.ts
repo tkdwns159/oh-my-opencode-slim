@@ -15,6 +15,7 @@ import { fileURLToPath } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '..');
 const distEntry = path.join(repoRoot, 'dist', 'index.js');
+const opencodeVersion = process.env.OPENCODE_SMOKE_VERSION?.trim() || 'latest';
 
 function fail(message: string): never {
   throw new Error(message);
@@ -197,8 +198,10 @@ async function verifyHostSmoke(tarballPath: string) {
       ),
     );
 
-    console.log('Installing opencode-ai into isolated test root...');
-    run('bun', ['add', 'opencode-ai@latest'], { cwd: hostDir });
+    console.log(
+      `Installing opencode-ai@${opencodeVersion} into isolated test root...`,
+    );
+    run('bun', ['add', `opencode-ai@${opencodeVersion}`], { cwd: hostDir });
 
     const opencodeBin = path.join(hostDir, 'node_modules', '.bin', 'opencode');
     if (!existsSync(opencodeBin)) {
@@ -293,17 +296,20 @@ async function verifyHostSmoke(tarballPath: string) {
         ),
         exitPromise,
       ]);
+
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+      assertNoPluginLoadErrors(`${stdout}\n${stderr}`);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       fail(
         `${message}\nCaptured OpenCode logs:\n${formatCapturedLogs(stdout, stderr)}`,
       );
+    } finally {
+      // Always terminate the spawned server, including on the health-check
+      // failure path where stopProcess would otherwise never be reached and
+      // the child process would leak away after the temp dir is removed.
+      await stopProcess(child);
     }
-
-    await new Promise((resolve) => setTimeout(resolve, 1500));
-    assertNoPluginLoadErrors(`${stdout}\n${stderr}`);
-
-    await stopProcess(child);
   } finally {
     rmSync(tempRoot, { recursive: true, force: true });
   }

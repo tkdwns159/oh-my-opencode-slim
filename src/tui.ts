@@ -1,13 +1,18 @@
 import type {
   TuiCommand,
+  TuiPlugin,
   TuiPluginApi,
-  TuiPluginModule,
 } from '@opencode-ai/plugin/tui';
 import { type ColorInput, parseColor, RGBA } from '@opentui/core';
 import type { JSX } from '@opentui/solid';
 import { createElement, insert, setProp } from '@opentui/solid';
+import { createSignal } from 'solid-js';
 import { DEFAULT_DISABLED_AGENTS, SUBAGENT_NAMES } from './config/constants';
 import { loadPluginConfig } from './config/loader';
+import {
+  recordTmuxPane,
+  removeTmuxPane,
+} from './multiplexer/tmux-pane-registry';
 import { openPresetManager } from './tui-preset';
 import {
   readTuiSnapshot,
@@ -25,6 +30,20 @@ const FALLBACK_SIDEBAR_AGENTS = SUBAGENT_NAMES.filter(
     !DEFAULT_DISABLED_AGENTS.includes(agent),
 );
 const BORDER = { type: 'single' };
+const TMUX_PANE_HEARTBEAT_MS = 10_000;
+const ACTIVITY_FRAME_MS = 100;
+const ACTIVITY_FRAMES = [
+  '⠋',
+  '⠙',
+  '⠹',
+  '⠸',
+  '⠼',
+  '⠴',
+  '⠦',
+  '⠧',
+  '⠇',
+  '⠏',
+] as const;
 
 type Child = JSX.Element | string | number | null | undefined | false;
 
@@ -58,7 +77,7 @@ function element(
     insert(node, child);
   }
 
-  return node as JSX.Element;
+  return node as unknown as JSX.Element;
 }
 
 function text(props: Record<string, unknown>, children: Child[]) {
@@ -69,10 +88,91 @@ function box(props: Record<string, unknown>, children: Child[] = []) {
   return element('box', props, children);
 }
 
+function reactiveElement(render: () => JSX.Element): JSX.Element {
+  const root = box({ width: '100%', flexDirection: 'column' });
+  insert(root, render);
+  return root;
+}
+
 function getTuiDirectory(api: {
   state?: { path?: { directory?: string } };
 }): string {
   return api.state?.path?.directory ?? process.cwd();
+}
+
+export interface ActiveTmuxPaneRegistration {
+  sessionId?: string;
+  paneId?: string;
+  ownerPid: number;
+  lastRecordedAt: number;
+}
+
+/** Route shapes accepted by `syncTmuxPaneRegistration`: v1 `{ name, params }` and v2 `{ type, sessionID }`. */
+export type TuiRouteView =
+  | {
+      name?: string;
+      params?: { sessionID?: unknown };
+    }
+  | {
+      type?: string;
+      sessionID?: string;
+    };
+
+function resolveRouteSessionId(route: TuiRouteView): string | undefined {
+  const view = route as {
+    name?: string;
+    params?: { sessionID?: unknown };
+    type?: string;
+    sessionID?: string;
+  };
+  if (view.name === 'session' && typeof view.params?.sessionID === 'string') {
+    return view.params.sessionID;
+  }
+  if (view.type === 'session' && typeof view.sessionID === 'string') {
+    return view.sessionID;
+  }
+  return undefined;
+}
+
+function clearTmuxPaneRegistration(
+  registration: ActiveTmuxPaneRegistration,
+): void {
+  if (registration.sessionId && registration.paneId) {
+    removeTmuxPane(
+      registration.sessionId,
+      registration.paneId,
+      registration.ownerPid,
+    );
+  }
+  registration.sessionId = undefined;
+  registration.paneId = undefined;
+  registration.lastRecordedAt = 0;
+}
+
+export function syncTmuxPaneRegistration(
+  route: TuiRouteView,
+  registration: ActiveTmuxPaneRegistration,
+  now = Date.now(),
+): void {
+  const paneId = process.env.TMUX_PANE;
+  const sessionId = resolveRouteSessionId(route);
+  const unchanged =
+    registration.sessionId === sessionId && registration.paneId === paneId;
+
+  if (!paneId || !sessionId) {
+    clearTmuxPaneRegistration(registration);
+    return;
+  }
+  if (unchanged && now - registration.lastRecordedAt < TMUX_PANE_HEARTBEAT_MS) {
+    return;
+  }
+  if (!unchanged) clearTmuxPaneRegistration(registration);
+
+  if (recordTmuxPane(sessionId, paneId, registration.ownerPid)) {
+    registration.sessionId = sessionId;
+    registration.paneId = paneId;
+    registration.lastRecordedAt = now;
+  }
 }
 
 export function splitSidebarModelId(model: string): {
@@ -97,11 +197,48 @@ export function getSidebarAgentNames(snapshot: TuiSnapshot): string[] {
     : FALLBACK_SIDEBAR_AGENTS;
 }
 
+export function getActiveSidebarAgentNames(
+  snapshot: TuiSnapshot,
+): ReadonlySet<string> {
+  return new Set(Object.values(snapshot.activeSessions));
+}
+
+export function getSidebarActivityIndicator(
+  active: boolean,
+  now = Date.now(),
+): string {
+  if (!active) return ' ';
+  const frame = Math.floor(now / ACTIVITY_FRAME_MS) % ACTIVITY_FRAMES.length;
+  return ACTIVITY_FRAMES[frame];
+}
+
+interface AgentRowTheme {
+  accent: unknown;
+  text: unknown;
+  textMuted: unknown;
+}
+
+function activityIndicator(
+  active: boolean,
+  now: number,
+  theme: AgentRowTheme,
+): JSX.Element {
+  return text(
+    {
+      fg: active ? (theme.accent ?? theme.text) : theme.textMuted,
+      width: 2,
+    },
+    [getSidebarActivityIndicator(active, now)],
+  );
+}
+
 function agentRow(
   label: string,
   model: string,
   variant: string | undefined,
-  theme: { textMuted: unknown },
+  active: boolean,
+  now: number,
+  theme: AgentRowTheme,
 ): JSX.Element {
   const modelParts = splitSidebarModelId(model);
   const detailRows: JSX.Element[] = [];
@@ -122,7 +259,10 @@ function agentRow(
   }
 
   return box({ width: '100%', flexDirection: 'column', marginBottom: 1 }, [
-    text({ fg: theme.textMuted }, [label]),
+    box({ width: '100%', flexDirection: 'row' }, [
+      text({ fg: theme.textMuted, width: 14 }, [label]),
+      activityIndicator(active, now, theme),
+    ]),
     ...detailRows,
   ]);
 }
@@ -131,7 +271,9 @@ function compactAgentRow(
   label: string,
   model: string,
   _variant: string | undefined,
-  theme: { textMuted: unknown },
+  active: boolean,
+  now: number,
+  theme: AgentRowTheme,
 ): JSX.Element {
   const modelName = splitSidebarModelId(model).model;
   return box(
@@ -141,8 +283,19 @@ function compactAgentRow(
       justifyContent: 'space-between',
     },
     [
-      text({ fg: theme.textMuted, width: 14 }, [label]),
-      text({ fg: theme.textMuted }, [modelName]),
+      box({ width: 16, flexShrink: 0, flexDirection: 'row' }, [
+        text({ fg: theme.textMuted, width: 14 }, [label]),
+        activityIndicator(active, now, theme),
+      ]),
+      text(
+        {
+          fg: theme.textMuted,
+          wrapMode: 'none',
+          truncate: true,
+          flexShrink: 1,
+        },
+        [modelName],
+      ),
     ],
   );
 }
@@ -214,8 +367,10 @@ function renderSidebar(
   },
   configInvalid: boolean,
   compactSidebar: boolean,
+  now = Date.now(),
 ): JSX.Element {
   const configStatusRow = buildConfigStatusRow(configInvalid, theme);
+  const activeAgents = getActiveSidebarAgentNames(snapshot);
   return box(
     {
       width: '100%',
@@ -261,10 +416,11 @@ function renderSidebar(
       ...getSidebarAgentNames(snapshot).map((agentName) => {
         const model = snapshot.agentModels[agentName] ?? 'pending';
         const variant = snapshot.agentVariants[agentName];
+        const active = activeAgents.has(agentName);
         if (compactSidebar) {
-          return compactAgentRow(agentName, model, variant, theme);
+          return compactAgentRow(agentName, model, variant, active, now, theme);
         }
-        return agentRow(agentName, model, variant, theme);
+        return agentRow(agentName, model, variant, active, now, theme);
       }),
     ],
   );
@@ -323,6 +479,117 @@ export function readCompactSidebar(directory: string): boolean {
   return readConfigState(directory).compactSidebar;
 }
 
+// Mirrors @opencode-ai/plugin@0.0.0-beta-17793 dist/tui/context.d.ts;
+// declared locally because the pinned dep ships v1 types only.
+interface V2TuiThemeTokens {
+  text: { default: unknown; subdued: unknown };
+  background: { default: unknown };
+  border: { default: unknown };
+}
+
+interface V2TuiSlotClaim {
+  append?: string;
+  prepend?: string;
+  before?: string;
+  after?: string;
+  replace?: string;
+  render: (input: { sessionID: string }) => JSX.Element;
+}
+
+interface V2TuiContext {
+  location?: { directory: string };
+  renderer: { requestRender: () => void };
+  theme: V2TuiThemeTokens;
+  ui: {
+    slot: (claim: V2TuiSlotClaim) => () => void;
+    router: { current: () => { type?: string; sessionID?: string } };
+  };
+}
+
+/** Map v2 theme tokens onto the flat shape `renderSidebar` consumes (v2 has no `accent` token). */
+function v2ThemeView(theme: V2TuiThemeTokens): {
+  accent: undefined;
+  background: unknown;
+  borderActive: unknown;
+  text: unknown;
+  textMuted: unknown;
+} {
+  return {
+    accent: undefined,
+    background: theme.background.default,
+    borderActive: theme.border.default,
+    text: theme.text.default,
+    textMuted: theme.text.subdued,
+  };
+}
+
+/**
+ * V2 entry point: sidebar slot + refresh loop; returns cleanup.
+ * `/preset` stays v1-only (`api.command` is absent on v2).
+ */
+async function setup(ctx: V2TuiContext): Promise<undefined | (() => void)> {
+  if (isPluginDisabledByEnv()) return;
+
+  const version = (await readPackageVersion()) ?? 'dev';
+  let configDirectory = ctx.location?.directory ?? process.cwd();
+  let { configInvalid, compactSidebar } = readConfigState(configDirectory);
+  const [snapshot, setSnapshot] = createSignal(
+    readTuiSnapshot(configDirectory),
+  );
+  const [animationNow, setAnimationNow] = createSignal(Date.now());
+  const tmuxRegistration: ActiveTmuxPaneRegistration = {
+    ownerPid: process.pid,
+    lastRecordedAt: 0,
+  };
+  syncTmuxPaneRegistration(ctx.ui.router.current(), tmuxRegistration);
+  let disposed = false;
+  const renderTimer = setInterval(async () => {
+    if (disposed) return;
+    try {
+      const currentDirectory = ctx.location?.directory ?? process.cwd();
+      syncTmuxPaneRegistration(ctx.ui.router.current(), tmuxRegistration);
+      const nextSnapshot = await readTuiSnapshotAsync(currentDirectory);
+      if (disposed) return;
+      if (currentDirectory !== configDirectory) {
+        configDirectory = currentDirectory;
+        ({ configInvalid, compactSidebar } = readConfigState(configDirectory));
+      }
+      setSnapshot(nextSnapshot);
+      ctx.renderer.requestRender();
+    } catch {
+      // Ignore render errors; this is best-effort live status.
+    }
+  }, 1000);
+  const animationTimer = setInterval(() => {
+    if (!disposed && Object.keys(snapshot().activeSessions).length > 0) {
+      setAnimationNow(Date.now());
+    }
+  }, ACTIVITY_FRAME_MS);
+
+  const disposeSlot = ctx.ui.slot({
+    append: 'sidebar.content',
+    render: () =>
+      reactiveElement(() =>
+        renderSidebar(
+          snapshot(),
+          version,
+          v2ThemeView(ctx.theme),
+          configInvalid,
+          compactSidebar,
+          animationNow(),
+        ),
+      ),
+  });
+
+  return () => {
+    disposed = true;
+    disposeSlot();
+    clearInterval(renderTimer);
+    clearInterval(animationTimer);
+    clearTmuxPaneRegistration(tmuxRegistration);
+  };
+}
+
 /**
  * Build the TUI slash command for `/preset`. Registered via the legacy
  * `api.command` API (still populated in OpenCode 1.18 for v1 plugins). If the
@@ -349,7 +616,17 @@ function buildPresetCommand(
   };
 }
 
-const plugin: TuiPluginModule & { id: string } = {
+/**
+ * Dual contract: v1 hosts validate `{ id, tui }`, opencode2 validates
+ * `{ id, setup }`; both ignore extra keys. Fixes #1002.
+ */
+interface TuiDualContractModule {
+  id: string;
+  tui: TuiPlugin;
+  setup: (ctx: V2TuiContext) => Promise<undefined | (() => void)>;
+}
+
+const plugin: TuiDualContractModule = {
   id: `${PLUGIN_NAME}:tui`,
   tui: async (api, _options, meta) => {
     if (isPluginDisabledByEnv()) return;
@@ -357,36 +634,56 @@ const plugin: TuiPluginModule & { id: string } = {
     const version = meta.version ?? (await readPackageVersion()) ?? 'dev';
     let configDirectory = getTuiDirectory(api);
     let { configInvalid, compactSidebar } = readConfigState(configDirectory);
-    let snapshot = readTuiSnapshot(configDirectory);
+    const [snapshot, setSnapshot] = createSignal(
+      readTuiSnapshot(configDirectory),
+    );
+    const [animationNow, setAnimationNow] = createSignal(Date.now());
+    const tmuxRegistration: ActiveTmuxPaneRegistration = {
+      ownerPid: process.pid,
+      lastRecordedAt: 0,
+    };
+    syncTmuxPaneRegistration(api.route.current, tmuxRegistration);
     const renderTimer = setInterval(async () => {
       try {
         const currentDirectory = getTuiDirectory(api);
-        snapshot = await readTuiSnapshotAsync(currentDirectory);
+        syncTmuxPaneRegistration(api.route.current, tmuxRegistration);
+        const nextSnapshot = await readTuiSnapshotAsync(currentDirectory);
         if (currentDirectory !== configDirectory) {
           configDirectory = currentDirectory;
           ({ configInvalid, compactSidebar } =
             readConfigState(configDirectory));
         }
+        setSnapshot(nextSnapshot);
         api.renderer.requestRender();
       } catch {
         // Ignore render errors; this is best-effort live status.
       }
     }, 1000);
+    const animationTimer = setInterval(() => {
+      if (Object.keys(snapshot().activeSessions).length > 0) {
+        setAnimationNow(Date.now());
+      }
+    }, ACTIVITY_FRAME_MS);
 
     api.lifecycle.onDispose(() => {
       clearInterval(renderTimer);
+      clearInterval(animationTimer);
+      clearTmuxPaneRegistration(tmuxRegistration);
     });
 
     api.slots.register({
       order: 900,
       slots: {
         sidebar_content() {
-          return renderSidebar(
-            snapshot,
-            version,
-            api.theme.current,
-            configInvalid,
-            compactSidebar,
+          return reactiveElement(() =>
+            renderSidebar(
+              snapshot(),
+              version,
+              api.theme.current,
+              configInvalid,
+              compactSidebar,
+              animationNow(),
+            ),
           );
         },
       },
@@ -400,10 +697,10 @@ const plugin: TuiPluginModule & { id: string } = {
     if (api.command) {
       const snapshotRef: { snapshot: TuiSnapshot } = {
         get snapshot() {
-          return snapshot;
+          return snapshot();
         },
         set snapshot(value: TuiSnapshot) {
-          snapshot = value;
+          setSnapshot(value);
         },
       };
       const disposeCommands = api.command.register(() => [
@@ -412,6 +709,7 @@ const plugin: TuiPluginModule & { id: string } = {
       api.lifecycle.onDispose(disposeCommands);
     }
   },
+  setup,
 };
 
 export default plugin;

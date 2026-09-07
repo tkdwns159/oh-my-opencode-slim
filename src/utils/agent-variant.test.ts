@@ -1,6 +1,15 @@
 import { describe, expect, test } from 'bun:test';
 import type { PluginConfig } from '../config';
+import { RuntimeConfig } from '../config/runtime';
 import { normalizeAgentName, resolveRuntimeAgentName } from './agent-variant';
+
+const TEST_DIRECTORY = 'runtime-test-agent-variant';
+
+function runtimeFor(config: PluginConfig | undefined = {}) {
+  RuntimeConfig.reset(TEST_DIRECTORY);
+  RuntimeConfig.init(TEST_DIRECTORY, config ?? {});
+  return RuntimeConfig.get(TEST_DIRECTORY);
+}
 
 describe('normalizeAgentName', () => {
   test('returns name unchanged if no @ prefix', () => {
@@ -32,7 +41,9 @@ describe('resolveRuntimeAgentName', () => {
       },
     } as PluginConfig;
 
-    expect(resolveRuntimeAgentName(config, 'oracle')).toBe('oracle');
+    expect(resolveRuntimeAgentName(runtimeFor(config), 'oracle')).toBe(
+      'oracle',
+    );
   });
 
   test('resolves displayName to internal name', () => {
@@ -42,7 +53,15 @@ describe('resolveRuntimeAgentName', () => {
       },
     } as PluginConfig;
 
-    expect(resolveRuntimeAgentName(config, 'advisor')).toBe('oracle');
+    expect(resolveRuntimeAgentName(runtimeFor(config), 'advisor')).toBe(
+      'oracle',
+    );
+  });
+
+  test('resolves legacy aliases to internal names', () => {
+    expect(
+      resolveRuntimeAgentName(runtimeFor({} as PluginConfig), 'explore'),
+    ).toBe('explorer');
   });
 
   test('resolves displayName with @ prefix and whitespace', () => {
@@ -52,7 +71,9 @@ describe('resolveRuntimeAgentName', () => {
       },
     } as PluginConfig;
 
-    expect(resolveRuntimeAgentName(config, '  @advisor  ')).toBe('oracle');
+    expect(resolveRuntimeAgentName(runtimeFor(config), '  @advisor  ')).toBe(
+      'oracle',
+    );
   });
 
   test('resolves displayName configured via legacy alias key', () => {
@@ -62,7 +83,9 @@ describe('resolveRuntimeAgentName', () => {
       },
     } as PluginConfig;
 
-    expect(resolveRuntimeAgentName(config, 'researcher')).toBe('explorer');
+    expect(resolveRuntimeAgentName(runtimeFor(config), 'researcher')).toBe(
+      'explorer',
+    );
   });
 
   test('returns normalized name when no displayName match exists', () => {
@@ -72,6 +95,8 @@ describe('resolveRuntimeAgentName', () => {
       },
     } as PluginConfig;
 
-    expect(resolveRuntimeAgentName(config, '  @unknown  ')).toBe('unknown');
+    expect(resolveRuntimeAgentName(runtimeFor(config), '  @unknown  ')).toBe(
+      'unknown',
+    );
   });
 });

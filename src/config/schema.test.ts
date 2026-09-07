@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { PluginConfigSchema } from './schema';
+import { InterviewConfigSchema, PluginConfigSchema } from './schema';
 
 describe('PluginConfigSchema image_routing', () => {
   it('accepts image_routing: direct with observer disabled', () => {
@@ -64,6 +64,75 @@ describe('PluginConfigSchema webfetch', () => {
   });
 });
 
+describe('InterviewConfigSchema outputFolder', () => {
+  it('accepts relative output folders', () => {
+    expect(
+      InterviewConfigSchema.safeParse({ outputFolder: 'interviews/specs' })
+        .success,
+    ).toBe(true);
+    expect(
+      InterviewConfigSchema.safeParse({
+        outputFolder: String.raw`interviews\specs`,
+      }).success,
+    ).toBe(true);
+  });
+
+  it('rejects absolute and parent-directory output folders', () => {
+    const invalidOutputFolders = [
+      '/tmp/interviews',
+      String.raw`\tmp\interviews`,
+      'C:/tmp/interviews',
+      String.raw`C:\tmp\interviews`,
+      '..',
+      '../interviews',
+      String.raw`..\interviews`,
+      'interviews/../outside',
+      String.raw`interviews\..\outside`,
+    ];
+
+    for (const outputFolder of invalidOutputFolders) {
+      expect(InterviewConfigSchema.safeParse({ outputFolder }).success).toBe(
+        false,
+      );
+      expect(
+        PluginConfigSchema.safeParse({ interview: { outputFolder } }).success,
+      ).toBe(false);
+    }
+  });
+
+  it('rejects whitespace-wrapped parent-directory output folders', () => {
+    const invalidOutputFolders = [' ../outside ', String.raw` ..\outside `];
+
+    for (const outputFolder of invalidOutputFolders) {
+      expect(InterviewConfigSchema.safeParse({ outputFolder }).success).toBe(
+        false,
+      );
+      expect(
+        PluginConfigSchema.safeParse({ interview: { outputFolder } }).success,
+      ).toBe(false);
+    }
+  });
+
+  it('stores the trimmed output folder', () => {
+    const outputFolder = '  interviews/specs  ';
+    const interviewResult = InterviewConfigSchema.safeParse({ outputFolder });
+    const pluginResult = PluginConfigSchema.safeParse({
+      interview: { outputFolder },
+    });
+
+    expect(interviewResult.success).toBe(true);
+    expect(pluginResult.success).toBe(true);
+    if (interviewResult.success) {
+      expect(interviewResult.data.outputFolder).toBe('interviews/specs');
+    }
+    if (pluginResult.success) {
+      expect(pluginResult.data.interview?.outputFolder).toBe(
+        'interviews/specs',
+      );
+    }
+  });
+});
+
 describe('PluginConfigSchema backgroundJobs', () => {
   it('defaults board injection to the legacy latest strategy', () => {
     const result = PluginConfigSchema.safeParse({ backgroundJobs: {} });
@@ -75,34 +144,55 @@ describe('PluginConfigSchema backgroundJobs', () => {
     }
   });
 
-  it('defaults continueOnIdle to false', () => {
+  it('defaults orchestratorWake to enabled with a 5-minute interval', () => {
     const result = PluginConfigSchema.safeParse({ backgroundJobs: {} });
 
     expect(result.success).toBe(true);
     if (result.success) {
-      expect(result.data.backgroundJobs?.continueOnIdle).toBe(false);
+      expect(result.data.backgroundJobs?.orchestratorWake).toEqual({
+        enabled: true,
+        intervalMs: 300_000,
+      });
     }
   });
 
-  it('accepts explicit continueOnIdle true', () => {
+  it('accepts explicit orchestratorWake overrides', () => {
     const result = PluginConfigSchema.safeParse({
-      backgroundJobs: { continueOnIdle: true },
+      backgroundJobs: {
+        orchestratorWake: { enabled: false, intervalMs: 120_000 },
+      },
     });
 
     expect(result.success).toBe(true);
     if (result.success) {
-      expect(result.data.backgroundJobs?.continueOnIdle).toBe(true);
+      expect(result.data.backgroundJobs?.orchestratorWake).toEqual({
+        enabled: false,
+        intervalMs: 120_000,
+      });
     }
   });
 
-  it('accepts explicit continueOnIdle false', () => {
-    const result = PluginConfigSchema.safeParse({
-      backgroundJobs: { continueOnIdle: false },
-    });
+  it('rejects orchestratorWake.intervalMs below 60_000 including 0', () => {
+    for (const intervalMs of [0, 1, 59_999, 60_000.5, -1]) {
+      expect(
+        PluginConfigSchema.safeParse({
+          backgroundJobs: { orchestratorWake: { intervalMs } },
+        }).success,
+      ).toBe(false);
+    }
+  });
 
-    expect(result.success).toBe(true);
-    if (result.success) {
-      expect(result.data.backgroundJobs?.continueOnIdle).toBe(false);
+  it('accepts orchestratorWake.intervalMs bounds', () => {
+    for (const intervalMs of [60_000, 300_000, 2_147_483_647]) {
+      const result = PluginConfigSchema.safeParse({
+        backgroundJobs: { orchestratorWake: { intervalMs } },
+      });
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.backgroundJobs?.orchestratorWake?.intervalMs).toBe(
+          intervalMs,
+        );
+      }
     }
   });
 
@@ -150,6 +240,72 @@ describe('PluginConfigSchema backgroundJobs', () => {
     if (result.success) {
       expect(result.data.backgroundJobs?.wallClockTimeoutMs).toBe(0);
       expect(result.data.backgroundJobs?.abortGraceMs).toBe(10_000);
+    }
+  });
+
+  it('defaults background task concurrency limits to disabled', () => {
+    const result = PluginConfigSchema.safeParse({ backgroundJobs: {} });
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.backgroundJobs?.concurrency).toEqual({
+        defaultConcurrency: 0,
+        providerConcurrency: {},
+        modelConcurrency: {},
+      });
+    }
+  });
+
+  it('accepts default, provider, and model concurrency limits', () => {
+    const result = PluginConfigSchema.safeParse({
+      backgroundJobs: {
+        concurrency: {
+          defaultConcurrency: 2,
+          providerConcurrency: { openai: 3 },
+          modelConcurrency: { 'openai/gpt-5.6-luna': 1 },
+        },
+      },
+    });
+
+    expect(result.success).toBe(true);
+  });
+
+  it('rejects invalid background task concurrency limits', () => {
+    for (const concurrency of [
+      { defaultConcurrency: -1 },
+      { defaultConcurrency: 1001 },
+      { defaultConcurrency: 1.5 },
+      { providerConcurrency: { openai: -1 } },
+      { providerConcurrency: { openai: 1.5 } },
+      { modelConcurrency: { 'openai/gpt-5.6-luna': -1 } },
+      { modelConcurrency: { 'openai/gpt-5.6-luna': 1.5 } },
+    ]) {
+      expect(
+        PluginConfigSchema.safeParse({ backgroundJobs: { concurrency } })
+          .success,
+      ).toBe(false);
+    }
+  });
+
+  it('accepts zero as unlimited for provider and model caps', () => {
+    const result = PluginConfigSchema.safeParse({
+      backgroundJobs: {
+        concurrency: {
+          defaultConcurrency: 2,
+          providerConcurrency: { openai: 0 },
+          modelConcurrency: { 'openai/gpt-5.6-luna': 0 },
+        },
+      },
+    });
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(
+        result.data.backgroundJobs?.concurrency?.providerConcurrency,
+      ).toEqual({ openai: 0 });
+      expect(result.data.backgroundJobs?.concurrency?.modelConcurrency).toEqual(
+        { 'openai/gpt-5.6-luna': 0 },
+      );
     }
   });
 

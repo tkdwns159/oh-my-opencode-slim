@@ -121,6 +121,15 @@ describe('isFailoverError', () => {
     );
   });
 
+  test('returns true for bailian "quota has been exhausted" (issue #1083)', () => {
+    expect(
+      isRetryableError({
+        message:
+          'Your token-plan 1-week quota has been exhausted. The quota will reset at 08-27 15:33:00 UTC.',
+      }),
+    ).toBe(true);
+  });
+
   test('returns true for codex quota-threshold errors', () => {
     expect(
       isFailoverError({
@@ -133,6 +142,59 @@ describe('isFailoverError', () => {
         'AI_APICallError: [codex/gpt-5.6-sol-medium] All codex accounts reached configured quota threshold (reset after 20h 41m 59s)',
       ),
     ).toBe(true);
+  });
+
+  test('returns true for content-policy moderation rejections (cyber_policy)', () => {
+    // OpenAI moderation surfaces as HTTP 400 invalid_request with the
+    // provider-specific policy code; deterministic per provider, so the next
+    // model in the chain must be tried instead of failing the request.
+    expect(
+      isFailoverError(
+        'AI_APICallError: This content was flagged for possible cybersecurity risk. If this seems wrong, try rephrasing your request. To get authorized for security work, join the Trusted Access for Cyber program: https://chatgpt.com/cyber',
+      ),
+    ).toBe(true);
+    expect(
+      isFailoverError({
+        data: {
+          statusCode: 400,
+          message:
+            'This content was flagged for possible cybersecurity risk. If this seems wrong, try rephrasing your request. To get authorized for security work, join the Trusted Access for Cyber program: https://chatgpt.com/cyber',
+        },
+      }),
+    ).toBe(true);
+    expect(
+      isFailoverError({
+        data: {
+          statusCode: 400,
+          responseBody:
+            '{"error":{"type":"invalid_request","code":"cyber_policy"}}',
+        },
+      }),
+    ).toBe(true);
+    expect(
+      isFailoverError({
+        data: {
+          statusCode: 400,
+          responseBody:
+            '{"error":{"code":"content_policy_violation","message":"Your request was rejected as a result of our safety system."}}',
+        },
+      }),
+    ).toBe(true);
+  });
+
+  test('returns false for generic flagged/policy wording without the moderation signature', () => {
+    // Only the structured code or the exact provider wording match; ordinary
+    // errors mentioning "flagged", "cybersecurity", or "policy" stay hard
+    // errors.
+    expect(
+      isFailoverError({ message: 'request flagged for review by the proxy' }),
+    ).toBe(false);
+    expect(
+      isFailoverError({ message: 'analysis of cybersecurity topics rejected' }),
+    ).toBe(false);
+    expect(
+      isFailoverError({ message: 'policy update required for this model' }),
+    ).toBe(false);
   });
 
   test('returns true for "usage exceeded"', () => {
@@ -195,6 +257,42 @@ describe('isFailoverError', () => {
 
   test('returns true for 403 status code', () => {
     expect(isRetryableError({ data: { statusCode: 403 } })).toBe(true);
+  });
+
+  test('returns true for 401 status code', () => {
+    expect(isRetryableError({ statusCode: 401 })).toBe(true);
+    expect(isRetryableError({ data: { statusCode: 401 } })).toBe(true);
+  });
+
+  test('returns true for 410 Gone (model end-of-life)', () => {
+    expect(isRetryableError({ statusCode: 410 })).toBe(true);
+    expect(isRetryableError({ data: { statusCode: 410 } })).toBe(true);
+    expect(
+      isRetryableError({
+        message:
+          "The model 'mistralai/mistral-small-4-119b-2603' has reached its end of life on 2026-07-27T00:00:00Z and is no longer available.",
+      }),
+    ).toBe(true);
+    // The AI SDK surfaces HTTP 410 as the bare title "Gone" in the message.
+    expect(isRetryableError({ message: 'AI_APICallError: Gone' })).toBe(true);
+    expect(isRetryableError('Gone')).toBe(true);
+  });
+
+  test('returns true for 401 upstream provider error message', () => {
+    expect(
+      isRetryableError(
+        'AI_APICallError: Upstream request failed: [401] Provider returned error',
+      ),
+    ).toBe(true);
+    expect(
+      isRetryableError({
+        message:
+          'AI_APICallError: Upstream request failed: [401] Provider returned error',
+      }),
+    ).toBe(true);
+    expect(
+      isRetryableError({ data: { message: 'Upstream request failed [401]' } }),
+    ).toBe(true);
   });
 
   test('returns true for "Forbidden" in message', () => {
@@ -261,6 +359,36 @@ describe('isFailoverError', () => {
         message: 'channel not found for model gpt-5.6-luna',
       }),
     ).toBe(false);
+  });
+
+  test('returns true for OpenCode ProviderModelNotFoundError "Model not found" errors', () => {
+    // Issue #1034: OpenCode's ProviderModelNotFoundError ("Model not found:
+    // <model>") was not classified as a failover error, so a missing primary
+    // model failed the task outright instead of advancing the fallback chain.
+    // The reporter's error string always carries the message; the bare
+    // camelCase class name "ProviderModelNotFoundError" (no spaces) does not
+    // match /\bmodel not found\b/i and is intentionally not covered here.
+    expect(
+      isFailoverError(
+        'ProviderModelNotFoundError: Model not found: custom/missing-model.',
+      ),
+    ).toBe(true);
+    expect(
+      isFailoverError({ message: 'Model not found: custom/missing-model' }),
+    ).toBe(true);
+  });
+
+  test('returns true for existing model-outage patterns (regression guard)', () => {
+    expect(isFailoverError('model not available')).toBe(true);
+    expect(isFailoverError('unsupported model')).toBe(true);
+    expect(isFailoverError('unknown model')).toBe(true);
+  });
+
+  test('returns false for normal errors and model mentions without outage wording', () => {
+    expect(isFailoverError('Cannot connect to database')).toBe(false);
+    expect(isFailoverError({ message: 'invalid model configuration' })).toBe(
+      false,
+    );
   });
 });
 
@@ -334,10 +462,51 @@ describe('ForegroundFallbackManager session.error', () => {
         model: { providerID: string; modelID: string };
       },
     ];
-    expect(call[0].sessionID).toBe('sess-1');
+    expect(call[0].path.id).toBe('sess-1');
     // Should have picked the next model after anthropic/claude-opus-4-5
-    expect(call[0].model.providerID).toBe('openai');
-    expect(call[0].model.modelID).toBe('gpt-4o');
+    expect(call[0].body.model.providerID).toBe('openai');
+    expect(call[0].body.model.modelID).toBe('gpt-4o');
+  });
+
+  test('triggers fallback on content-policy moderation session.error', async () => {
+    // End-to-end regression: a cyber_policy rejection (HTTP 400
+    // invalid_request in production) must advance the fallback chain to the
+    // next model instead of failing the session outright.
+    await mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID: 'sess-1',
+          providerID: 'anthropic',
+          modelID: 'claude-opus-4-5',
+          role: 'assistant',
+        },
+      },
+    });
+
+    await mgr.handleEvent({
+      type: 'session.error',
+      properties: {
+        sessionID: 'sess-1',
+        error: {
+          message:
+            'This content was flagged for possible cybersecurity risk. If this seems wrong, try rephrasing your request. To get authorized for security work, join the Trusted Access for Cyber program: https://chatgpt.com/cyber',
+        },
+      },
+    });
+
+    expect(mocks.abort).toHaveBeenCalledTimes(0);
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+
+    const call = mocks.promptAsync.mock.calls[0] as [
+      {
+        sessionID: string;
+        model: { providerID: string; modelID: string };
+      },
+    ];
+    expect(call[0].path.id).toBe('sess-1');
+    expect(call[0].body.model.providerID).toBe('openai');
+    expect(call[0].body.model.modelID).toBe('gpt-4o');
   });
 
   test('triggers fallback on unavailable provider channel session.error', async () => {
@@ -372,8 +541,8 @@ describe('ForegroundFallbackManager session.error', () => {
         model: { providerID: string; modelID: string };
       },
     ];
-    expect(call[0].model.providerID).toBe('openai');
-    expect(call[0].model.modelID).toBe('gpt-4o');
+    expect(call[0].body.model.providerID).toBe('openai');
+    expect(call[0].body.model.modelID).toBe('gpt-4o');
   });
 
   test('triggers fallback on CliProxyAPI auth-unavailable session.error', async () => {
@@ -408,8 +577,8 @@ describe('ForegroundFallbackManager session.error', () => {
         model: { providerID: string; modelID: string };
       },
     ];
-    expect(call[0].model.providerID).toBe('openai');
-    expect(call[0].model.modelID).toBe('gpt-4o');
+    expect(call[0].body.model.providerID).toBe('openai');
+    expect(call[0].body.model.modelID).toBe('gpt-4o');
   });
 
   test('triggers fallback on cannot-connect session.error', async () => {
@@ -443,8 +612,44 @@ describe('ForegroundFallbackManager session.error', () => {
         model: { providerID: string; modelID: string };
       },
     ];
-    expect(call[0].model.providerID).toBe('openai');
-    expect(call[0].model.modelID).toBe('gpt-4o');
+    expect(call[0].body.model.providerID).toBe('openai');
+    expect(call[0].body.model.modelID).toBe('gpt-4o');
+  });
+
+  test('triggers fallback on ProviderModelNotFoundError session.error', async () => {
+    await mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID: 'sess-1',
+          providerID: 'anthropic',
+          modelID: 'claude-opus-4-5',
+          role: 'assistant',
+        },
+      },
+    });
+
+    await mgr.handleEvent({
+      type: 'session.error',
+      properties: {
+        sessionID: 'sess-1',
+        error: {
+          message:
+            'ProviderModelNotFoundError: Model not found: custom/missing-model.',
+        },
+      },
+    });
+
+    expect(mocks.abort).not.toHaveBeenCalled();
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+
+    const call = mocks.promptAsync.mock.calls[0] as [
+      {
+        model: { providerID: string; modelID: string };
+      },
+    ];
+    expect(call[0].body.model.providerID).toBe('openai');
+    expect(call[0].body.model.modelID).toBe('gpt-4o');
   });
 
   test('marks the replayed user prompt as an internal initiator', async () => {
@@ -469,7 +674,7 @@ describe('ForegroundFallbackManager session.error', () => {
     });
 
     const call = mocks.promptAsync.mock.calls[0] as [{ parts: unknown[] }];
-    expect(call[0].parts.some(isInternalInitiatorPart)).toBe(true);
+    expect(call[0].body.parts.some(isInternalInitiatorPart)).toBe(true);
   });
 
   test('skips malformed messages without info when locating the last user message', async () => {
@@ -515,7 +720,7 @@ describe('ForegroundFallbackManager session.error', () => {
     const call = mocks.promptAsync.mock.calls[0] as [
       { parts: Array<{ text?: string }> },
     ];
-    expect(call[0].parts[0]?.text).toBe('real prompt');
+    expect(call[0].body.parts[0]?.text).toBe('real prompt');
   });
 
   test('replays the last user message from v2-shaped session.messages data', async () => {
@@ -561,7 +766,7 @@ describe('ForegroundFallbackManager session.error', () => {
     const call = mocks.promptAsync.mock.calls[0] as [
       { parts: Array<{ text?: string }> },
     ];
-    expect(call[0].parts[0]?.text).toBe('v2 prompt');
+    expect(call[0].body.parts[0]?.text).toBe('v2 prompt');
   });
 
   test('prefers the latest user message across mixed v1/v2 shapes', async () => {
@@ -602,7 +807,7 @@ describe('ForegroundFallbackManager session.error', () => {
     const call = mocks.promptAsync.mock.calls[0] as [
       { parts: Array<{ text?: string }> },
     ];
-    expect(call[0].parts[0]?.text).toBe('v2 prompt');
+    expect(call[0].body.parts[0]?.text).toBe('v2 prompt');
   });
 
   test('does nothing when error is not a rate limit', async () => {
@@ -676,6 +881,108 @@ describe('ForegroundFallbackManager session.error', () => {
     expect(mocks.abort).toHaveBeenCalledTimes(1);
     expect(mocks.promptAsync).toHaveBeenCalledTimes(2);
   });
+
+  test('shows a toast when fallback switches models on a transient error', async () => {
+    const { mocks } = createMockClient();
+    const showToast = mock(async () => ({}));
+    const mgr = new ForegroundFallbackManager(makeChains(), true, {
+      directory: '/test',
+      client: { tui: { showToast } },
+    } as any);
+
+    await mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID: 'sess-1',
+          providerID: 'anthropic',
+          modelID: 'claude-opus-4-5',
+          role: 'assistant',
+        },
+      },
+    });
+
+    await mgr.handleEvent({
+      type: 'session.error',
+      properties: {
+        sessionID: 'sess-1',
+        error: { statusCode: 429, message: 'Rate limit exceeded' },
+      },
+    });
+
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+    expect(showToast).toHaveBeenCalledTimes(1);
+    const toastCall = showToast.mock.calls[0]?.[0] as {
+      body?: { title?: string; message?: string; variant?: string };
+    };
+    expect(toastCall?.body?.title).toBe('Model fallback');
+    expect(toastCall?.body?.variant).toBe('warning');
+    expect(toastCall?.body?.message).toContain('openai');
+  });
+
+  test('does not toast when fallback is triggered by an inline 410/401 error', async () => {
+    const { mocks } = createMockClient();
+    const showToast = mock(async () => ({}));
+    const mgr = new ForegroundFallbackManager(makeChains(), true, {
+      directory: '/test',
+      client: { tui: { showToast } },
+    } as any);
+
+    await mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID: 'sess-1',
+          providerID: 'anthropic',
+          modelID: 'claude-opus-4-5',
+          role: 'assistant',
+        },
+      },
+    });
+
+    await mgr.handleEvent({
+      type: 'session.error',
+      properties: {
+        sessionID: 'sess-1',
+        error: { statusCode: 410, message: 'AI_APICallError: Gone' },
+      },
+    });
+
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+    expect(showToast).not.toHaveBeenCalled();
+  });
+
+  test('does not toast when the inline 410 error arrives as a bare string', async () => {
+    const { mocks } = createMockClient();
+    const showToast = mock(async () => ({}));
+    const mgr = new ForegroundFallbackManager(makeChains(), true, {
+      directory: '/test',
+      client: { tui: { showToast } },
+    } as any);
+
+    await mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID: 'sess-1',
+          providerID: 'anthropic',
+          modelID: 'claude-opus-4-5',
+          role: 'assistant',
+        },
+      },
+    });
+
+    await mgr.handleEvent({
+      type: 'session.error',
+      properties: {
+        sessionID: 'sess-1',
+        error: 'AI_APICallError: Gone',
+      },
+    });
+
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+    expect(showToast).not.toHaveBeenCalled();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -707,8 +1014,8 @@ describe('ForegroundFallbackManager message.updated', () => {
         model: { providerID: string; modelID: string };
       },
     ];
-    expect(call[0].model.providerID).toBe('openai');
-    expect(call[0].model.modelID).toBe('gpt-4o');
+    expect(call[0].body.model.providerID).toBe('openai');
+    expect(call[0].body.model.modelID).toBe('gpt-4o');
   });
 
   test('uses agent name from message.updated to select correct chain', async () => {
@@ -739,8 +1046,8 @@ describe('ForegroundFallbackManager message.updated', () => {
     ];
     // explorer chain: ['openai/gpt-4o-mini', 'anthropic/claude-haiku']
     // current=gpt-4o-mini is tried → next = claude-haiku
-    expect(call[0].model.providerID).toBe('anthropic');
-    expect(call[0].model.modelID).toBe('claude-haiku');
+    expect(call[0].body.model.providerID).toBe('anthropic');
+    expect(call[0].body.model.modelID).toBe('claude-haiku');
   });
 });
 
@@ -831,7 +1138,7 @@ describe('ForegroundFallbackManager session.status', () => {
     const call = mocks.promptAsync.mock.calls[0] as [
       { model: { providerID: string; modelID: string } },
     ];
-    expect(call[0].model).toEqual({ providerID: 'openai', modelID: 'o3' });
+    expect(call[0].body.model).toEqual({ providerID: 'openai', modelID: 'o3' });
   });
 
   test('includes the sticky child agent in fallback promptAsync body', async () => {
@@ -872,8 +1179,8 @@ describe('ForegroundFallbackManager session.status', () => {
         model: { providerID: string; modelID: string };
       },
     ];
-    expect(call[0].agent).toBe('oracle');
-    expect(call[0].model).toEqual({ providerID: 'openai', modelID: 'o3' });
+    expect(call[0].body.agent).toBe('oracle');
+    expect(call[0].body.model).toEqual({ providerID: 'openai', modelID: 'o3' });
   });
 
   test('triggers fallback on retry status with rate limit message', async () => {
@@ -1121,6 +1428,39 @@ describe('ForegroundFallbackManager session.status', () => {
     expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
   });
 
+  test('does not toast when 410 signal arrives via status.message with no error property', async () => {
+    const { mocks } = createMockClient();
+    const showToast = mock(async () => ({}));
+    const mgr = new ForegroundFallbackManager(makeChains(), true, {
+      directory: '/test',
+      client: { tui: { showToast } },
+    } as any);
+
+    await mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID: 'sess-status-message-410',
+          providerID: 'anthropic',
+          modelID: 'claude-opus-4-5',
+        },
+      },
+    });
+
+    // The AI SDK surfaces HTTP 410 as a bare retry status message with no
+    // separate error property. The runtime renders it inline — no toast.
+    await mgr.handleEvent({
+      type: 'session.status',
+      properties: {
+        sessionID: 'sess-status-message-410',
+        status: { type: 'retry', attempt: 1, message: 'AI_APICallError: Gone' },
+      },
+    });
+
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+    expect(showToast).not.toHaveBeenCalled();
+  });
+
   test('non-rate-limit retry does not trigger fallback but rate-limit does', async () => {
     const { mocks } = createMockClient();
     const mgr = new ForegroundFallbackManager(
@@ -1218,7 +1558,7 @@ describe('ForegroundFallbackManager session.status', () => {
     const firstCall = mocks.promptAsync.mock.calls[0] as [
       { model: { providerID: string; modelID: string } },
     ];
-    expect(firstCall[0].model).toEqual({
+    expect(firstCall[0].body.model).toEqual({
       providerID: 'openai',
       modelID: 'gpt-4o',
     });
@@ -1294,7 +1634,7 @@ describe('ForegroundFallbackManager session.status', () => {
     const firstCall = mocks.promptAsync.mock.calls[0] as [
       { model: { providerID: string; modelID: string } },
     ];
-    expect(firstCall[0].model).toEqual({
+    expect(firstCall[0].body.model).toEqual({
       providerID: 'openai',
       modelID: 'gpt-4o',
     });
@@ -1320,7 +1660,7 @@ describe('ForegroundFallbackManager session.status', () => {
     const secondCall = mocks.promptAsync.mock.calls[1] as [
       { model: { providerID: string; modelID: string } },
     ];
-    expect(secondCall[0].model).toEqual({
+    expect(secondCall[0].body.model).toEqual({
       providerID: 'google',
       modelID: 'gemini-2.5-pro',
     });
@@ -1332,6 +1672,303 @@ describe('ForegroundFallbackManager session.status', () => {
 // ---------------------------------------------------------------------------
 
 describe('ForegroundFallbackManager chain exhaustion', () => {
+  test('re-walks from the second chain entry on each new user turn', async () => {
+    const { mocks } = createMockClient();
+    const mgr = new ForegroundFallbackManager(makeChains(), true, {
+      directory: '/test',
+    } as any);
+    const sessionID = 'sess-turns';
+
+    await mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID,
+          agent: 'orchestrator',
+          providerID: 'anthropic',
+          modelID: 'claude-opus-4-5',
+          role: 'assistant',
+        },
+      },
+    });
+
+    const realNowFn = Date.now;
+    let fakeNow = realNowFn();
+    Date.now = () => fakeNow;
+    try {
+      fakeNow += 6_000;
+      await mgr.handleEvent({
+        type: 'session.error',
+        properties: { sessionID, error: { message: 'rate limit exceeded' } },
+      });
+      expect(mocks.promptAsync).toHaveBeenCalledWith(
+        expect.objectContaining({
+          body: expect.objectContaining({
+            model: { providerID: 'openai', modelID: 'gpt-4o' },
+          }),
+        }),
+      );
+
+      await mgr.handleEvent({
+        type: 'message.updated',
+        properties: {
+          info: {
+            sessionID,
+            agent: 'orchestrator',
+            role: 'assistant',
+            providerID: 'openai',
+            modelID: 'gpt-4o',
+            time: { created: 1, completed: 2 },
+          },
+        },
+      });
+      await mgr.handleEvent({
+        type: 'message.updated',
+        properties: {
+          info: {
+            sessionID,
+            agent: 'orchestrator',
+            role: 'assistant',
+            providerID: 'anthropic',
+            modelID: 'claude-opus-4-5',
+          },
+        },
+      });
+
+      fakeNow += 6_000;
+      await mgr.handleEvent({
+        type: 'session.error',
+        properties: { sessionID, error: { message: 'rate limit exceeded' } },
+      });
+
+      expect(mocks.promptAsync.mock.calls[1]?.[0]).toEqual(
+        expect.objectContaining({
+          body: expect.objectContaining({
+            model: { providerID: 'openai', modelID: 'gpt-4o' },
+          }),
+        }),
+      );
+    } finally {
+      Date.now = realNowFn;
+    }
+  });
+
+  test('recovers fallback after a chain-exhaustion abort when a new turn returns to the primary', async () => {
+    const { mocks } = createMockClient();
+    const mgr = new ForegroundFallbackManager(
+      { orchestrator: ['openai/gpt-b', 'openai/gpt-c'] },
+      true,
+      { directory: '/test' } as any,
+    );
+    const sessionID = 'sess-recover-after-abort';
+
+    await mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID,
+          agent: 'orchestrator',
+          providerID: 'openai',
+          modelID: 'gpt-b',
+          role: 'assistant',
+        },
+      },
+    });
+
+    const realNowFn = Date.now;
+    let fakeNow = realNowFn();
+    Date.now = () => fakeNow;
+    try {
+      const fail = async () => {
+        fakeNow += 6_000;
+        await mgr.handleEvent({
+          type: 'session.error',
+          properties: {
+            sessionID,
+            error: { message: 'rate limit exceeded' },
+          },
+        });
+      };
+
+      await fail();
+      await fail();
+      await fail();
+      expect(mocks.promptAsync).toHaveBeenCalledTimes(2);
+      expect(mocks.abort).toHaveBeenCalledTimes(1);
+
+      // Deliberately omit time.completed: this is not a successful response;
+      // recovery must come from the fresh descent reset instead.
+      await mgr.handleEvent({
+        type: 'message.updated',
+        properties: {
+          info: {
+            sessionID,
+            agent: 'orchestrator',
+            providerID: 'openai',
+            modelID: 'gpt-b',
+            role: 'assistant',
+          },
+        },
+      });
+
+      await fail();
+      expect(mocks.promptAsync).toHaveBeenCalledTimes(3);
+      expect(mocks.promptAsync.mock.calls[2]?.[0]).toEqual(
+        expect.objectContaining({
+          body: expect.objectContaining({
+            model: { providerID: 'openai', modelID: 'gpt-c' },
+          }),
+        }),
+      );
+      expect(mgr.willAttemptFallback(sessionID)).toBe(true);
+    } finally {
+      Date.now = realNowFn;
+    }
+  });
+
+  test('does not fall back onto an earlier chain entry', async () => {
+    const { mocks } = createMockClient();
+    const mgr = new ForegroundFallbackManager(makeChains(), true, {
+      directory: '/test',
+    } as any);
+    const sessionID = 'sess-mid-chain';
+
+    await mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID,
+          agent: 'orchestrator',
+          providerID: 'openai',
+          modelID: 'gpt-4o',
+          role: 'assistant',
+        },
+      },
+    });
+    await mgr.handleEvent({
+      type: 'session.error',
+      properties: { sessionID, error: { message: 'rate limit exceeded' } },
+    });
+
+    expect(mocks.promptAsync.mock.calls[0]?.[0]).toEqual(
+      expect.objectContaining({
+        body: expect.objectContaining({
+          model: { providerID: 'google', modelID: 'gemini-2.5-pro' },
+        }),
+      }),
+    );
+    expect(mocks.promptAsync.mock.calls[0]?.[0].body.model).not.toEqual({
+      providerID: 'anthropic',
+      modelID: 'claude-opus-4-5',
+    });
+  });
+
+  test('does not fall back onto the primary when the current model is off-chain', async () => {
+    const { mocks } = createMockClient();
+    const mgr = new ForegroundFallbackManager(makeChains(), true, {
+      directory: '/test',
+    } as any);
+    const sessionID = 'sess-off-chain';
+
+    await mgr.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          sessionID,
+          agent: 'orchestrator',
+          providerID: 'anthropic',
+          modelID: 'claude-opus-4-5',
+          role: 'assistant',
+        },
+      },
+    });
+
+    const realNowFn = Date.now;
+    let fakeNow = realNowFn();
+    Date.now = () => fakeNow;
+    try {
+      fakeNow += 6_000;
+      await mgr.handleEvent({
+        type: 'session.error',
+        properties: { sessionID, error: { message: 'rate limit exceeded' } },
+      });
+      await mgr.handleEvent({
+        type: 'message.updated',
+        properties: {
+          info: {
+            sessionID,
+            agent: 'orchestrator',
+            providerID: 'openai',
+            modelID: 'gpt-4o-mini',
+            role: 'assistant',
+          },
+        },
+      });
+
+      fakeNow += 6_000;
+      await mgr.handleEvent({
+        type: 'session.error',
+        properties: { sessionID, error: { message: 'rate limit exceeded' } },
+      });
+
+      expect(mocks.promptAsync.mock.calls[1]?.[0]).toEqual(
+        expect.objectContaining({
+          body: expect.objectContaining({
+            model: { providerID: 'google', modelID: 'gemini-2.5-pro' },
+          }),
+        }),
+      );
+      expect(mocks.promptAsync.mock.calls[1]?.[0].body.model).not.toEqual({
+        providerID: 'anthropic',
+        modelID: 'claude-opus-4-5',
+      });
+    } finally {
+      Date.now = realNowFn;
+    }
+  });
+
+  test('does not reset the descent when the current model was inferred, not observed', async () => {
+    createMockClient({ messagesData: [] });
+    const mgr = new ForegroundFallbackManager(
+      { orchestrator: ['a/1', 'b/2', 'c/3'] },
+      true,
+      { directory: '/test' } as any,
+    );
+    const sessionID = 'sess-inferred-model';
+
+    await mgr.handleEvent({
+      type: 'subagent.session.created',
+      properties: { sessionID, agentName: 'orchestrator' },
+    });
+
+    const realNowFn = Date.now;
+    let fakeNow = realNowFn();
+    Date.now = () => fakeNow;
+    try {
+      const fail = async () => {
+        fakeNow += 6_000;
+        await mgr.handleEvent({
+          type: 'session.error',
+          properties: {
+            sessionID,
+            error: { message: 'rate limit exceeded' },
+          },
+        });
+      };
+
+      await fail();
+      await fail();
+
+      expect([...(mgr as any).sessionTried.get(sessionID)]).toEqual([
+        'a/1',
+        'b/2',
+        'c/3',
+      ]);
+    } finally {
+      Date.now = realNowFn;
+    }
+  });
+
   test('does not call promptAsync when the only chain model is already the current model', async () => {
     // Scenario: chain = ['openai/gpt-b'], current model IS 'openai/gpt-b'.
     // tryFallback adds 'openai/gpt-b' to tried → chain.find() returns undefined → exhausted.
@@ -1607,6 +2244,8 @@ describe('ForegroundFallbackManager chain exhaustion', () => {
     }
   });
 
+  // Protects the tried.size > 1 invariant in execFallback: a single-model
+  // chain must not re-abort repeatedly after exhaustion.
   test('does not abort repeatedly for single-model chains after exhaustion', async () => {
     const { mocks } = createMockClient();
     const mgr = new ForegroundFallbackManager(
@@ -1728,7 +2367,9 @@ describe('ForegroundFallbackManager deduplication', () => {
     expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
     expect(mocks.promptAsync.mock.calls[0][0]).toEqual(
       expect.objectContaining({
-        model: { providerID: 'openai', modelID: 'gpt-4o' },
+        body: expect.objectContaining({
+          model: { providerID: 'openai', modelID: 'gpt-4o' },
+        }),
       }),
     );
 
@@ -1748,7 +2389,9 @@ describe('ForegroundFallbackManager deduplication', () => {
     expect(mocks.promptAsync).toHaveBeenCalledTimes(2);
     expect(mocks.promptAsync.mock.calls[1][0]).toEqual(
       expect.objectContaining({
-        model: { providerID: 'google', modelID: 'gemini-2.5-pro' },
+        body: expect.objectContaining({
+          model: { providerID: 'google', modelID: 'gemini-2.5-pro' },
+        }),
       }),
     );
   });
@@ -1786,8 +2429,8 @@ describe('ForegroundFallbackManager subagent.session.created', () => {
     // explorer chain: ['openai/gpt-4o-mini', 'anthropic/claude-haiku']
     // agentName known → currentModel inferred as chain[0] (primary)
     // primary is tried → fallback picks claude-haiku
-    expect(call[0].model.providerID).toBe('anthropic');
-    expect(call[0].model.modelID).toBe('claude-haiku');
+    expect(call[0].body.model.providerID).toBe('anthropic');
+    expect(call[0].body.model.modelID).toBe('claude-haiku');
   });
 });
 
@@ -1841,8 +2484,8 @@ describe('ForegroundFallbackManager session.deleted', () => {
     ];
     // orchestrator chain: ['anthropic/claude-opus-4-5', 'openai/gpt-4o', 'google/gemini-2.5-pro']
     // no current model → first untried = anthropic/claude-opus-4-5
-    expect(call[0].model.providerID).toBe('anthropic');
-    expect(call[0].model.modelID).toBe('claude-opus-4-5');
+    expect(call[0].body.model.providerID).toBe('anthropic');
+    expect(call[0].body.model.modelID).toBe('claude-opus-4-5');
   });
 
   test('ignores session.deleted with no sessionID', async () => {
@@ -1939,6 +2582,55 @@ describe('ForegroundFallbackManager session.deleted', () => {
 });
 
 // ---------------------------------------------------------------------------
+// ForegroundFallbackManager - willAttemptFallback
+// ---------------------------------------------------------------------------
+
+describe('ForegroundFallbackManager willAttemptFallback', () => {
+  test('returns true when the session has a chain and it is not exhausted', () => {
+    const mgr = new ForegroundFallbackManager(makeChains(), true, {
+      directory: '/test',
+    } as any);
+    mgr.registerSessionAgent('sess-1', 'orchestrator');
+    expect(mgr.willAttemptFallback('sess-1')).toBe(true);
+  });
+
+  test('returns false when fallback is disabled', () => {
+    const mgr = new ForegroundFallbackManager(makeChains(), false, {
+      directory: '/test',
+    } as any);
+    mgr.registerSessionAgent('sess-1', 'orchestrator');
+    expect(mgr.willAttemptFallback('sess-1')).toBe(false);
+  });
+
+  test('returns false for a known agent without a configured chain', () => {
+    const mgr = new ForegroundFallbackManager(makeChains(), true, {
+      directory: '/test',
+    } as any);
+    // oracle has no chain in makeChains(); resolveChain must not bleed
+    // into another agent's chain, so no fallback is possible.
+    mgr.registerSessionAgent('sess-oracle', 'oracle');
+    expect(mgr.willAttemptFallback('sess-oracle')).toBe(false);
+  });
+
+  test('returns false when the chain is exhausted (stage 2)', () => {
+    const mgr = new ForegroundFallbackManager(makeChains(), true, {
+      directory: '/test',
+    } as any);
+    mgr.registerSessionAgent('sess-1', 'orchestrator');
+    (mgr as any).chainExhaustion.set('sess-1', 2);
+    expect(mgr.willAttemptFallback('sess-1')).toBe(false);
+  });
+
+  test('returns true while a fallback is in flight even after exhaustion', () => {
+    const mgr = new ForegroundFallbackManager(makeChains(), true, {
+      directory: '/test',
+    } as any);
+    (mgr as any).inProgress.add('sess-1');
+    expect(mgr.willAttemptFallback('sess-1')).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // ForegroundFallbackManager - resolveChain correctness
 // ---------------------------------------------------------------------------
 
@@ -1998,8 +2690,8 @@ describe('ForegroundFallbackManager resolveChain cross-agent isolation', () => {
     const call = mocks.promptAsync.mock.calls[0] as [
       { model: { providerID: string; modelID: string } },
     ];
-    expect(call[0].model.providerID).toBe('openai');
-    expect(call[0].model.modelID).toBe('gpt-4o');
+    expect(call[0].body.model.providerID).toBe('openai');
+    expect(call[0].body.model.modelID).toBe('gpt-4o');
   });
 
   test('does NOT bleed into other agent chains for non-omos agents without a chain', async () => {
@@ -2205,7 +2897,7 @@ describe('ForegroundFallbackManager disableChain', () => {
     ];
     // explorer chain: ['openai/gpt-4o-mini', 'anthropic/claude-haiku']
     // current = gpt-4o-mini is tried → next = claude-haiku
-    expect(call[0].model.providerID).toBe('anthropic');
-    expect(call[0].model.modelID).toBe('claude-haiku');
+    expect(call[0].body.model.providerID).toBe('anthropic');
+    expect(call[0].body.model.modelID).toBe('claude-haiku');
   });
 });

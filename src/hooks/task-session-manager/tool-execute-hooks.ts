@@ -8,10 +8,13 @@
 import type {
   BackgroundJobStore,
   BackgroundJobSupervisor,
+  BackgroundTaskConcurrency,
   ContextFile,
 } from '../../utils';
 import {
+  deriveFullObjective,
   deriveTaskSessionLabel,
+  guardCompletedStatusText,
   parseTaskIdFromTaskOutput,
   parseTaskLaunchOutput,
   parseTaskStatusOutput,
@@ -32,6 +35,36 @@ interface TaskArgs {
   background?: unknown;
 }
 
+const earlyRegistrationGenerations = new WeakMap<PendingTaskCall, number>();
+function normalizeObjectiveKey(value: string): string {
+  return value.replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+/**
+ * session.created writes earlyRegisteredTaskID through the pending-call
+ * object. Capture the generation at that boundary so a delayed native result
+ * cannot reuse the current record after a same-ID relaunch.
+ */
+function installEarlyRegistrationGenerationFence(
+  pending: PendingTaskCall,
+  backgroundJobBoard: BackgroundJobStore,
+): void {
+  let earlyRegisteredTaskID = pending.earlyRegisteredTaskID;
+  Object.defineProperty(pending, 'earlyRegisteredTaskID', {
+    configurable: true,
+    enumerable: true,
+    get: () => earlyRegisteredTaskID,
+    set: (taskID: string | undefined) => {
+      earlyRegisteredTaskID = taskID;
+      if (!taskID) return;
+      const generation = backgroundJobBoard.get(taskID)?.generation;
+      if (generation !== undefined) {
+        earlyRegistrationGenerations.set(pending, generation);
+      }
+    },
+  });
+}
+
 export async function handleToolExecuteBefore(
   input: { tool: string; sessionID?: string; callID?: string },
   output: { args?: unknown },
@@ -41,10 +74,18 @@ export async function handleToolExecuteBefore(
     backgroundJobBoard: BackgroundJobStore;
     pendingCallTracker: {
       add(call: PendingTaskCall): void;
+      take(callID?: string, sessionID?: string): PendingTaskCall | undefined;
+      release?(call: PendingTaskCall): void;
       pendingCallId(sessionID?: string, callID?: string): string;
     };
     taskContextTracker: { pendingManagedTaskIds: Set<string> };
     backgroundJobSupervisor?: BackgroundJobSupervisor;
+    backgroundTaskConcurrency?: BackgroundTaskConcurrency;
+    getModelForAgent?: (
+      agentType: string,
+      parentSessionID?: string,
+    ) => string | undefined;
+    getLifecycleEpoch?: () => number;
   },
 ): Promise<void> {
   const toolName = input.tool.toLowerCase();
@@ -93,7 +134,15 @@ export async function handleToolExecuteBefore(
     agentType,
     label,
     background,
+    lifecycleEpoch: deps.getLifecycleEpoch?.() ?? 0,
+    releaseLease: (lease) => deps.backgroundJobBoard.releaseLease(lease),
   };
+  pendingCall.fullObjective = deriveFullObjective({
+    description:
+      typeof args.description === 'string' ? args.description : undefined,
+    prompt: typeof args.prompt === 'string' ? args.prompt : undefined,
+  });
+  installEarlyRegistrationGenerationFence(pendingCall, deps.backgroundJobBoard);
   if (typeof args.task_id === 'string' && args.task_id.trim() !== '') {
     const requested = args.task_id.trim();
     const remembered =
@@ -115,7 +164,7 @@ export async function handleToolExecuteBefore(
       );
       if (knownManagedTask?.state === 'running') {
         throw new Error(
-          `Task ${requested} is still running and cannot be resumed or amended with task(). Do not spawn or cancel a duplicate for an additive request. Wait for its terminal result, then resume the automatically reconciled session if follow-up work is still needed.`,
+          `Task ${requested} is still running and cannot be resumed or amended with task(). Do not spawn or cancel a duplicate for an additive request. Wait for its terminal result, then resume the session after that terminal notification is acknowledged if follow-up work is still needed.`,
         );
       }
 
@@ -127,14 +176,80 @@ export async function handleToolExecuteBefore(
         delete args.task_id;
       }
     } else {
+      const relaunchLease = deps.backgroundJobBoard.acquireRelaunchLease(
+        remembered.taskID,
+        remembered.generation,
+      );
+      if (!relaunchLease) {
+        throw new Error(
+          `Task ${requested} cannot be resumed safely: its current generation is already owned by another lifecycle operation. Do not launch a duplicate with the same task_id.`,
+        );
+      }
       args.task_id = remembered.taskID;
       deps.taskContextTracker.pendingManagedTaskIds.add(remembered.taskID);
       deps.backgroundJobBoard.markUsed(input.sessionID, remembered.taskID);
       pendingCall.resumedTaskId = remembered.taskID;
+      pendingCall.relaunchLease = relaunchLease;
     }
   }
 
-  deps.pendingCallTracker.add(pendingCall);
+  // New spawns only: block re-dispatch of an objective already owned by an
+  // unreconciled terminal job from this parent (self-reinforcing dispatch
+  // loop, #1070). The full objective text is compared, not the 48-char display
+  // label, so long exact duplicates match while distinct objectives that only
+  // share a truncated prefix stay unaffected.
+  // Escape hatch: task_result retrieval after completion updates lastUsedAt
+  // beyond completedAt, marking the result as consumed and authorizing retry.
+  if (!pendingCall.resumedTaskId) {
+    const objectiveKey = normalizeObjectiveKey(
+      pendingCall.fullObjective ?? label,
+    );
+    const duplicate = deps.backgroundJobBoard
+      .list(input.sessionID)
+      .find(
+        (job) =>
+          job.agent === agentType &&
+          job.terminalUnreconciled &&
+          !(
+            job.completedAt !== undefined && job.lastUsedAt > job.completedAt
+          ) &&
+          normalizeObjectiveKey(job.objective || job.description) ===
+            objectiveKey,
+      );
+    if (duplicate) {
+      throw new Error(
+        `A background task with the same objective already finished and its result is awaiting acknowledgment: ${duplicate.alias} / ${duplicate.taskID}. Call task_result with task_id "${duplicate.taskID}" to retrieve it instead of spawning a duplicate. If the retrieved result is insufficient, retry the spawn after retrieval — retrieval authorizes the retry.`,
+      );
+    }
+  }
+
+  try {
+    deps.pendingCallTracker.add(pendingCall);
+    if (pendingCall.background && deps.backgroundTaskConcurrency) {
+      // Nested orchestration exemption: a session that is itself a managed
+      // task already holds an admission slot. Waiting for another one while
+      // the queue is saturated would deadlock — this session could never
+      // finish, so its own slot could never be released.
+      const isManagedTask = deps.backgroundJobBoard
+        .taskIDs()
+        .has(input.sessionID);
+      if (!isManagedTask) {
+        const ticket = deps.backgroundTaskConcurrency.acquire({
+          model: deps.getModelForAgent?.(
+            agentType,
+            pendingCall.parentSessionId,
+          ),
+        });
+        pendingCall.concurrencyTicket = ticket;
+        await ticket.ready;
+      }
+    }
+  } catch (error) {
+    const tracked = deps.pendingCallTracker.take(pendingCall.callId);
+    if (tracked) deps.pendingCallTracker.release?.(tracked);
+    else pendingCall.concurrencyTicket?.releaseIfUnbound();
+    throw error;
+  }
   log(
     '[task-session-manager] tool.execute.before task — pending call created',
     {
@@ -155,7 +270,12 @@ export async function handleToolExecuteAfter(
     directory: string;
     backgroundJobBoard: BackgroundJobStore;
     pendingCallTracker: {
-      take(callID?: string, sessionID?: string): PendingTaskCall | undefined;
+      take(
+        callID?: string,
+        sessionID?: string,
+        ownerBoard?: BackgroundJobStore,
+      ): PendingTaskCall | undefined;
+      release?(call: PendingTaskCall): void;
     };
     taskContextTracker: {
       pendingManagedTaskIds: Set<string>;
@@ -164,6 +284,16 @@ export async function handleToolExecuteAfter(
       prune(board: { taskIDs(): Set<string> }): void;
     };
     backgroundJobSupervisor?: BackgroundJobSupervisor;
+    bindConcurrencyTicket?: (taskID: string, pending: PendingTaskCall) => void;
+    releaseConcurrencyTask?: (taskID: string) => void;
+    /** Record direct task cleanup even when the store is a thin facade. */
+    recordLifecycleSuppression?: (taskID: string) => void;
+    /** Clear a deletion guard when a new native task output proves a run exists. */
+    clearRehydrateTombstone?: (taskID: string) => void;
+    isStaleDeletedTaskOutput?: (
+      taskID: string,
+      lifecycleEpoch: number,
+    ) => boolean;
   },
 ): Promise<void> {
   if (input.tool.toLowerCase() === 'read') {
@@ -190,6 +320,7 @@ export async function handleToolExecuteAfter(
   const pending = deps.pendingCallTracker.take(
     exactCallID,
     exactCallID ? undefined : input.sessionID,
+    deps.backgroundJobBoard,
   );
   const exactCallConfirmed =
     exactCallID !== undefined && pending?.callId === exactCallID;
@@ -204,98 +335,210 @@ export async function handleToolExecuteAfter(
         : undefined,
   });
 
-  if (!pending || typeof output.output !== 'string') return;
-  const launch = parseTaskLaunchOutput(output.output);
-  if (launch && !launch.result?.match(/Timed out after \d+ms/i)) {
-    const record = deps.backgroundJobBoard.registerLaunch({
-      taskID: launch.taskID,
+  if (!pending) return;
+
+  try {
+    if (typeof output.output !== 'string') return;
+    if (pending.earlyRegistrationRejected) {
+      log(
+        '[task-session-manager] ignored task output after fenced early registration',
+        { callID: pending.callId },
+      );
+      return;
+    }
+
+    const launch = parseTaskLaunchOutput(output.output);
+    if (launch && !launch.result?.match(/Timed out after \d+ms/i)) {
+      const record = registerTaskOutputLaunch(
+        launch.taskID,
+        pending,
+        exactCallConfirmed,
+        deps,
+      );
+      if (!record) return;
+      deps.bindConcurrencyTicket?.(record.taskID, pending);
+      deps.clearRehydrateTombstone?.(launch.taskID);
+      if (exactCallConfirmed) deps.backgroundJobSupervisor?.onLaunch(record);
+      log('[task-session-manager] background task launch registered', {
+        taskID: record.taskID,
+        alias: record.alias,
+        parentSessionID: record.parentSessionID,
+        agent: record.agent,
+        description: record.description,
+        state: record.state,
+      });
+      deps.taskContextTracker.pendingManagedTaskIds.add(launch.taskID);
+      deps.backgroundJobBoard.addContext(
+        launch.taskID,
+        deps.taskContextTracker.contextFilesForPrompt(launch.taskID),
+      );
+      return;
+    }
+
+    const status = parseTaskStatusOutput(output.output);
+    if (status) {
+      const record = registerTaskOutputLaunch(
+        status.taskID,
+        pending,
+        exactCallConfirmed,
+        deps,
+      );
+      if (!record) return;
+      deps.bindConcurrencyTicket?.(record.taskID, pending);
+      deps.clearRehydrateTombstone?.(status.taskID);
+      normalizeLateCancelledTaskOutput(output, deps.backgroundJobBoard);
+      if (exactCallConfirmed) deps.backgroundJobSupervisor?.onLaunch(record);
+      const guarded = guardCompletedStatusText(
+        status.state,
+        status.result,
+        record.resultSummary,
+      );
+      const updated = deps.backgroundJobBoard.updateStatus({
+        taskID: status.taskID,
+        state: guarded.state,
+        expectedGeneration: record.generation,
+        timedOut: status.timedOut,
+        resultSummary: guarded.resultSummary,
+        lastStatusError: guarded.lastStatusError,
+      });
+      if (updated?.state !== 'running') {
+        deps.releaseConcurrencyTask?.(status.taskID);
+      }
+      log('[task-session-manager] foreground task status registered', {
+        taskID: status.taskID,
+        alias: updated?.alias ?? record.alias,
+        parentSessionID: pending.parentSessionId,
+        agent: pending.agentType,
+        state: updated?.state ?? record.state,
+      });
+      deps.taskContextTracker.pendingManagedTaskIds.delete(status.taskID);
+      deps.backgroundJobBoard.addContext(
+        status.taskID,
+        deps.taskContextTracker.contextFilesForPrompt(status.taskID),
+      );
+      deps.taskContextTracker.prune(deps.backgroundJobBoard);
+      return;
+    }
+
+    const taskId = parseTaskIdFromTaskOutput(output.output);
+    if (!taskId) {
+      if (
+        pending.resumedTaskId &&
+        isMissingRememberedSessionError(output.output)
+      ) {
+        deps.recordLifecycleSuppression?.(pending.resumedTaskId);
+        deps.backgroundJobBoard.drop(pending.resumedTaskId);
+        deps.backgroundJobSupervisor?.drop(pending.resumedTaskId);
+      }
+      return;
+    }
+
+    if (pending.resumedTaskId && pending.resumedTaskId !== taskId) {
+      log(
+        '[task-session-manager] ignored task output with mismatched resumed task ID',
+        {
+          expectedTaskID: pending.resumedTaskId,
+          observedTaskID: taskId,
+          callID: pending.callId,
+        },
+      );
+      return;
+    }
+
+    deps.taskContextTracker.pendingManagedTaskIds.delete(taskId);
+    deps.backgroundJobBoard.addContext(
+      taskId,
+      deps.taskContextTracker.contextFilesForPrompt(taskId),
+    );
+    deps.taskContextTracker.prune(deps.backgroundJobBoard);
+  } finally {
+    deps.pendingCallTracker.release?.(pending);
+    if (pending.relaunchLease) {
+      deps.backgroundJobBoard.releaseLease(pending.relaunchLease);
+    }
+    pending.concurrencyTicket?.releaseIfUnbound();
+  }
+}
+
+function registerTaskOutputLaunch(
+  taskID: string,
+  pending: PendingTaskCall,
+  exactCallConfirmed: boolean,
+  deps: {
+    backgroundJobBoard: BackgroundJobStore;
+    backgroundJobSupervisor?: BackgroundJobSupervisor;
+    isStaleDeletedTaskOutput?: (
+      taskID: string,
+      lifecycleEpoch: number,
+    ) => boolean;
+  },
+): ReturnType<BackgroundJobStore['get']> {
+  if (deps.isStaleDeletedTaskOutput?.(taskID, pending.lifecycleEpoch)) {
+    log('[task-session-manager] ignored stale task output after deletion', {
+      taskID,
+      callID: pending.callId,
+      lifecycleEpoch: pending.lifecycleEpoch,
+    });
+    return undefined;
+  }
+
+  const resumed = pending.resumedTaskId !== undefined;
+  if (resumed && pending.resumedTaskId !== taskID) return undefined;
+
+  const existing = deps.backgroundJobBoard.get(taskID);
+  const earlyRegistrationGeneration =
+    pending.earlyRegistration?.generation ??
+    earlyRegistrationGenerations.get(pending);
+  if (
+    pending.earlyRegisteredTaskID === taskID &&
+    earlyRegistrationGeneration !== undefined &&
+    existing?.generation !== earlyRegistrationGeneration
+  ) {
+    log('[task-session-manager] ignored stale native task output', {
+      taskID,
+      callID: pending.callId,
+      registeredGeneration: earlyRegistrationGeneration,
+      currentGeneration: existing?.generation,
+    });
+    return undefined;
+  }
+  if (resumed && pending.relaunchLease === undefined) {
+    log(
+      '[task-session-manager] refused resumed task output without relaunch lease',
+      { taskID, callID: pending.callId },
+    );
+    return undefined;
+  }
+  if (!resumed && existing && pending.earlyRegistrationRejected) {
+    log(
+      '[task-session-manager] refused task output that collided with an existing task ID',
+      { taskID, callID: pending.callId },
+    );
+    return undefined;
+  }
+  if (pending.earlyRegisteredTaskID && !existing) return undefined;
+
+  try {
+    return deps.backgroundJobBoard.registerLaunch({
+      taskID,
       parentSessionID: pending.parentSessionId,
       agent: pending.agentType,
       description: pending.label,
-      objective: pending.label,
+      objective: pending.fullObjective ?? pending.label,
       background: exactCallConfirmed && pending.background,
-      preserveRun: pending.resumedTaskId === undefined,
+      preserveRun:
+        pending.earlyRegisteredTaskID === taskID ||
+        pending.resumedTaskId === undefined,
+      ...(pending.relaunchLease
+        ? { relaunchLease: pending.relaunchLease }
+        : {}),
     });
-    if (exactCallConfirmed) deps.backgroundJobSupervisor?.onLaunch(record);
-    log('[task-session-manager] background task launch registered', {
-      taskID: record.taskID,
-      alias: record.alias,
-      parentSessionID: record.parentSessionID,
-      agent: record.agent,
-      description: record.description,
-      state: record.state,
+  } catch (error) {
+    log('[task-session-manager] refused task output launch registration', {
+      taskID,
+      callID: pending.callId,
+      error: error instanceof Error ? error.message : String(error),
     });
-    deps.taskContextTracker.pendingManagedTaskIds.add(launch.taskID);
-    deps.backgroundJobBoard.addContext(
-      launch.taskID,
-      deps.taskContextTracker.contextFilesForPrompt(launch.taskID),
-    );
-    return;
+    return undefined;
   }
-
-  normalizeLateCancelledTaskOutput(output, deps.backgroundJobBoard);
-  const status = parseTaskStatusOutput(output.output);
-  if (status) {
-    const existing = deps.backgroundJobBoard.get(status.taskID);
-    const record =
-      existing ??
-      deps.backgroundJobBoard.registerLaunch({
-        taskID: status.taskID,
-        parentSessionID: pending.parentSessionId,
-        agent: pending.agentType,
-        description: pending.label,
-        objective: pending.label,
-        background: exactCallConfirmed && pending.background,
-        preserveRun: pending.resumedTaskId === undefined,
-      });
-    if (exactCallConfirmed) deps.backgroundJobSupervisor?.onLaunch(record);
-    const updated = deps.backgroundJobBoard.updateStatus({
-      taskID: status.taskID,
-      state: status.state,
-      timedOut: status.timedOut,
-      resultSummary: status.result,
-    });
-    log('[task-session-manager] foreground task status registered', {
-      taskID: status.taskID,
-      alias: updated?.alias ?? record.alias,
-      parentSessionID: pending.parentSessionId,
-      agent: pending.agentType,
-      state: updated?.state ?? record.state,
-    });
-    if (pending.resumedTaskId && pending.resumedTaskId !== status.taskID) {
-      deps.backgroundJobBoard.drop(pending.resumedTaskId);
-      deps.backgroundJobSupervisor?.drop(pending.resumedTaskId);
-    }
-    deps.taskContextTracker.pendingManagedTaskIds.delete(status.taskID);
-    deps.backgroundJobBoard.addContext(
-      status.taskID,
-      deps.taskContextTracker.contextFilesForPrompt(status.taskID),
-    );
-    deps.taskContextTracker.prune(deps.backgroundJobBoard);
-    return;
-  }
-
-  const taskId = parseTaskIdFromTaskOutput(output.output);
-  if (!taskId) {
-    if (
-      pending.resumedTaskId &&
-      isMissingRememberedSessionError(output.output)
-    ) {
-      deps.backgroundJobBoard.drop(pending.resumedTaskId);
-      deps.backgroundJobSupervisor?.drop(pending.resumedTaskId);
-    }
-    return;
-  }
-
-  if (pending.resumedTaskId && pending.resumedTaskId !== taskId) {
-    deps.backgroundJobBoard.drop(pending.resumedTaskId);
-    deps.backgroundJobSupervisor?.drop(pending.resumedTaskId);
-  }
-
-  deps.taskContextTracker.pendingManagedTaskIds.delete(taskId);
-  deps.backgroundJobBoard.addContext(
-    taskId,
-    deps.taskContextTracker.contextFilesForPrompt(taskId),
-  );
-  deps.taskContextTracker.prune(deps.backgroundJobBoard);
 }
