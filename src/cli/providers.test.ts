@@ -17,7 +17,6 @@ describe('providers', () => {
 
   test('generateLiteConfig defaults to openai and includes generated presets', () => {
     const config = generateLiteConfig({
-      installCustomSkills: false,
       backgroundSubagents: 'no',
       reset: false,
     });
@@ -33,27 +32,26 @@ describe('providers', () => {
     );
     const agents = (config.presets as any).openai;
     expect(agents).toBeDefined();
-    expect(agents.orchestrator.model).toBe('openai/gpt-5.6-terra');
+    expect(agents.orchestrator.model).toBe('openai/gpt-6-sol');
     expect(agents.orchestrator.variant).toBe('high');
-    expect(agents.fixer.model).toBe('openai/gpt-5.6-luna');
+    expect(agents.fixer.model).toBe('openai/gpt-6-luna');
     expect(agents.fixer.variant).toBe('high');
   });
 
   test('preserves exact OpenAI model and variant mappings', () => {
     const config = generateLiteConfig({
-      installCustomSkills: false,
       backgroundSubagents: 'no',
       reset: false,
     });
 
     const agents = (config.presets as any).openai;
     const expected = {
-      orchestrator: { model: 'openai/gpt-5.6-terra', variant: 'high' },
-      oracle: { model: 'openai/gpt-5.6-sol', variant: 'high' },
-      librarian: { model: 'openai/gpt-5.6-luna', variant: 'low' },
-      explorer: { model: 'openai/gpt-5.6-luna', variant: 'low' },
-      designer: { model: 'openai/gpt-5.6-luna', variant: 'medium' },
-      fixer: { model: 'openai/gpt-5.6-luna', variant: 'high' },
+      orchestrator: { model: 'openai/gpt-6-sol', variant: 'high' },
+      oracle: { model: 'openai/gpt-6-astra', variant: 'high' },
+      librarian: { model: 'openai/gpt-6-luna', variant: 'low' },
+      explorer: { model: 'openai/gpt-6-luna', variant: 'low' },
+      designer: { model: 'openai/gpt-6-luna', variant: 'medium' },
+      fixer: { model: 'openai/gpt-6-luna', variant: 'high' },
     } as const;
 
     expect(MODEL_MAPPINGS.openai).toEqual(expected);
@@ -62,7 +60,6 @@ describe('providers', () => {
 
   test('generateLiteConfig can set opencode-go as active preset', () => {
     const config = generateLiteConfig({
-      installCustomSkills: false,
       preset: 'opencode-go',
       backgroundSubagents: 'no',
       reset: false,
@@ -94,7 +91,6 @@ describe('providers', () => {
   test('generateLiteConfig rejects unsupported preset', () => {
     expect(() =>
       generateLiteConfig({
-        installCustomSkills: false,
         preset: 'not-real',
         backgroundSubagents: 'no',
         reset: false,
@@ -105,7 +101,6 @@ describe('providers', () => {
   test('generateLiteConfig rejects non-generated model mappings as active presets', () => {
     expect(() =>
       generateLiteConfig({
-        installCustomSkills: false,
         preset: 'kimi',
         backgroundSubagents: 'no',
         reset: false,
@@ -116,7 +111,6 @@ describe('providers', () => {
   test('generateLiteConfig rejects inherited property names as presets', () => {
     expect(() =>
       generateLiteConfig({
-        installCustomSkills: false,
         preset: 'toString',
         backgroundSubagents: 'no',
         reset: false,
@@ -126,7 +120,6 @@ describe('providers', () => {
 
   test('generateLiteConfig companion: yes', () => {
     const config = generateLiteConfig({
-      installCustomSkills: false,
       backgroundSubagents: 'no',
       reset: false,
       companion: 'yes',
@@ -140,7 +133,6 @@ describe('providers', () => {
 
   test('generateLiteConfig companion: no or omitted', () => {
     const configYes = generateLiteConfig({
-      installCustomSkills: false,
       backgroundSubagents: 'no',
       reset: false,
       companion: 'no',
@@ -148,7 +140,6 @@ describe('providers', () => {
     expect(configYes.companion).toBeUndefined();
 
     const configOmitted = generateLiteConfig({
-      installCustomSkills: false,
       backgroundSubagents: 'no',
       reset: false,
     });
@@ -157,7 +148,6 @@ describe('providers', () => {
 
   test('generateLiteConfig includes default skills', () => {
     const config = generateLiteConfig({
-      installCustomSkills: false,
       backgroundSubagents: 'no',
       reset: false,
     });
@@ -184,7 +174,6 @@ describe('providers', () => {
 
   test('generateLiteConfig includes mcps field', () => {
     const config = generateLiteConfig({
-      installCustomSkills: false,
       backgroundSubagents: 'no',
       reset: false,
     });
@@ -198,7 +187,6 @@ describe('providers', () => {
 
   test('generateLiteConfig openai includes correct mcps', () => {
     const config = generateLiteConfig({
-      installCustomSkills: false,
       backgroundSubagents: 'no',
       reset: false,
     });

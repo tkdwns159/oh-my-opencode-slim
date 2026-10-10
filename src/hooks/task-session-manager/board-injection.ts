@@ -7,7 +7,8 @@
  * All injection logic must go through the cache-safe helpers in
  * ../cache-safe-injection.ts to ensure prompt cache safety.
  */
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
+import { formatSystemReminder } from '../../config/constants';
 import type {
   BackgroundJobExecution,
   BackgroundJobInjectedCompletionFence,
@@ -26,6 +27,7 @@ import {
   parseTaskStatusOutput,
   renderRunningTaskPlaceholder,
 } from '../../utils';
+import type { BackgroundJobTerminalGate } from '../../utils/background-job-terminal-gate';
 import { isRecord } from '../../utils/guards';
 import { log } from '../../utils/logger';
 import {
@@ -39,17 +41,17 @@ import {
 } from '../cache-safe-injection';
 import type { MessagePart, MessageWithParts } from '../types';
 import { isMessageWithParts, isUserMessageWithParts } from '../types';
-import {
-  extractTaskSummary,
-  formatCancelledTaskStatusOutput,
-  isLateCancelledTaskError,
-  updateBackgroundJobFromOutput,
-} from './status-utils';
+import { extractTaskSummary, isLateCancelledTaskError } from './status-utils';
 
 // ── Constants ──────────────────────────────────────────────────────────
 
 export const BACKGROUND_JOB_BOARD_METADATA_KEY =
   'oh-my-opencode-slim.backgroundJobBoard';
+
+const UNCHANGED_BOARD_MARKER = formatSystemReminder(
+  '### Background Job Board unchanged since the last full snapshot.',
+);
+const MAX_UNCHANGED_MARKERS = 9;
 
 const BACKGROUND_COMPLETION_COMPLETED = /^Background task completed: /;
 const BACKGROUND_COMPLETION_FAILED = /^Background task failed: /;
@@ -63,6 +65,8 @@ type RetainedBoardSnapshot = {
 
 export type RetainedBoardSnapshotState = {
   snapshots: RetainedBoardSnapshot[];
+  /** Random per state instance, so ids differ across restarts and resets. */
+  epoch: string;
   nextSnapshotSequence: number;
   realMessageCount: number;
   firstRealMessageAnchorKey?: string;
@@ -74,18 +78,12 @@ export type RetainedBoardSnapshotState = {
  * every later request once that anchor is no longer the tail, so a board that
  * was sent on a message the provider has cached never disappears.
  *
- * Only ONE placement is ever retained: a board that rode as a trailing PART on
- * a USER anchor (`anchorRole: 'user'`). That is the only shape that can be
- * reproduced later without inserting a message mid-array (A1) or grafting board
- * text onto a non-user message (A3). `anchorRole` stays a plain string so
- * legacy in-memory entries recorded by an earlier build (notably `'assistant'`,
- * which was replayed by splicing a synthetic message directly after the anchor
- * and could orphan a tool call from its result) are recognized and dropped
- * instead of replayed.
+ * Only a board that rode as a trailing PART on a USER anchor is retained:
+ * it can be reproduced without inserting a message mid-array (A1) or grafting
+ * board text onto a non-user message (A3).
  */
 type RetainedTailBoard = {
   anchorId: string;
-  anchorRole: string;
   text: string;
 };
 
@@ -122,13 +120,160 @@ type SyntheticTerminalOccurrenceLookup =
 
 type SyntheticTerminalProvenanceKind = 'explicit' | 'host-message' | 'legacy';
 
+/** A terminal run the parent consumed (reconciled): reused to detect a
+ * reopen-to-running of the same run, which needs a corrective notice. */
+type ReportedTerminalRun = {
+  taskID: string;
+  generation: number;
+  /** Terminal state the parent saw (completed | error | cancelled). */
+  terminalState?: string;
+};
+
+/** A corrective notice delivered on the parent's next eligible request. */
+type ReopenCorrection = {
+  taskID: string;
+  generation: number;
+  alias: string;
+  priorTerminalState: string;
+};
+
+function reportedRunKey(taskID: string, generation: number): string {
+  return `${taskID}:${generation}`;
+}
+
+/** Corrective notice text for a reconciled job that reopened to running.
+ * Matches the board's system-reminder tone; carries the job identity and
+ * the supersession verdict inline. */
+export function formatReopenCorrectionText(
+  correction: ReopenCorrection,
+): string {
+  return formatSystemReminder(
+    [
+      '### Background Job Board — Reopened Job',
+      'A background job that previously reported a terminal result is running again; the earlier report is superseded.',
+      `- ${correction.alias} / ${correction.taskID} / run ${correction.generation} / previously ${correction.priorTerminalState}, now running`,
+      'Consult the Background Job Board for the current state before acting on the earlier result.',
+    ].join('\n'),
+  );
+}
+
+/** Board-injection-off variant of the reopen correction: same facts, but
+ * the pointer goes to the pull channel (the board is not injected in this
+ * mode, so pointing at it would reference a panel the model cannot see).
+ * The correction itself is a staleness notice, not board status — the
+ * native notifier covers terminal publications, not the reopen-to-running
+ * transition (#1314's anti-narration scope is board status lines). */
+export function formatReopenCorrectionTextNoBoard(
+  correction: ReopenCorrection,
+): string {
+  return formatSystemReminder(
+    [
+      '### Background Job — Reopened',
+      'A background job that previously reported a terminal result is running again; the earlier report is superseded.',
+      `- ${correction.alias} / ${correction.taskID} / run ${correction.generation} / previously ${correction.priorTerminalState}, now running`,
+      'Check `task_status` for the current state before acting on the earlier result.',
+    ].join('\n'),
+  );
+}
+
+/** Record that the parent consumed (reconciled) a terminal run, so a later
+ * reopen-to-running of the same run can be corrected. */
+function rememberReportedTerminalRun(
+  state: InjectionState,
+  parentSessionID: string,
+  run: ReportedTerminalRun,
+): void {
+  const reported = state.reportedTerminalRunsByParent?.get(parentSessionID);
+  if (reported) {
+    reported.set(reportedRunKey(run.taskID, run.generation), run);
+    return;
+  }
+  const map = new Map<string, ReportedTerminalRun>([
+    [reportedRunKey(run.taskID, run.generation), run],
+  ]);
+  if (state.reportedTerminalRunsByParent) {
+    state.reportedTerminalRunsByParent.set(parentSessionID, map);
+  } else {
+    state.reportedTerminalRunsByParent = new Map([[parentSessionID, map]]);
+  }
+}
+
+/**
+ * Deliver corrections for reported runs that reopened to running. Retire
+ * delivered runs and prune runs whose job left the board or was superseded by
+ * a newer generation. Called at injection time to reflect the current board
+ * without a separate event seam on the board store.
+ */
+function deliverReopenCorrections(
+  state: InjectionState,
+  parentSessionID: string,
+  messages: unknown[],
+  baseInfo: MessageWithParts['info'],
+): void {
+  const reported = state.reportedTerminalRunsByParent?.get(parentSessionID);
+  if (!reported || reported.size === 0) return;
+  for (const [key, run] of reported) {
+    const record = state.backgroundJobBoard.get(run.taskID);
+    if (record?.generation === run.generation && record.state !== 'running') {
+      continue;
+    }
+    reported.delete(key);
+    if (!record || record.generation !== run.generation) continue;
+
+    const correction: ReopenCorrection = {
+      taskID: run.taskID,
+      generation: run.generation,
+      alias: record.alias,
+      priorTerminalState: run.terminalState ?? 'completed',
+    };
+    log('[task-session-manager] queued reopen corrective notice', {
+      parentSessionID,
+      taskID: run.taskID,
+      generation: run.generation,
+      priorTerminalState: correction.priorTerminalState,
+    });
+    appendTrailingVolatileMessage(
+      messages,
+      {
+        ...baseInfo,
+        id: `${baseInfo.id ?? 'board'}-reopen-correction:${key}`,
+      },
+      {
+        text:
+          state.boardInjection !== false
+            ? formatReopenCorrectionText(correction)
+            : formatReopenCorrectionTextNoBoard(correction),
+        metadataKey: state.metadataKey,
+        extraMetadata: { reopenCorrection: true },
+      },
+    );
+  }
+  if (reported.size === 0) {
+    state.reportedTerminalRunsByParent?.delete(parentSessionID);
+  }
+}
+
+/**
+ * Prune reopen-correction bookkeeping for a parent session (session end).
+ * Reported runs must never surface in a recreated session.
+ */
+export function pruneReopenCorrectionState(
+  state: InjectionState,
+  parentSessionID: string,
+): void {
+  state.reportedTerminalRunsByParent?.delete(parentSessionID);
+}
+
 const HOST_MESSAGE_OCCURRENCE_PREFIX = 'host-message:';
 
 export interface InjectionState {
   backgroundJobBoard: BackgroundJobStore;
+  terminalGate: BackgroundJobTerminalGate;
   lifecycleLedger: BackgroundJobLifecycleLedger;
   maxRetainedSnapshots: number;
   strategy: 'latest' | 'checkpoint-compatible';
+  /** When false, the board reminder is never injected (backgroundJobs.boardInjection). */
+  boardInjection?: boolean;
   processedInjectedCompletions: Set<string>;
   processedInjectedCompletionOrder: string[];
   /**
@@ -150,6 +295,17 @@ export interface InjectionState {
     string,
     Map<string, BackgroundJobExecution>
   >;
+  /**
+   * Terminal runs this parent has already consumed (reconciled through
+   * `reconcileExecutionBatch`), keyed `${taskID}:${generation}`. Used to
+   * detect a reconciled job REOPENING to running (typically a child session
+   * resumed by its own background-shell notification): the parent's
+   * conversation still carries the earlier terminal report, so the reopen
+   * needs a corrective trailing notice. Delivered runs and superseded
+   * generations are retired on the next eligible request. Optional for
+   * states built before the field existed.
+   */
+  reportedTerminalRunsByParent?: Map<string, Map<string, ReportedTerminalRun>>;
   metadataKey: string;
   shouldManageSession: (sessionID: string) => boolean;
   taskContextTracker: {
@@ -688,13 +844,13 @@ export function stabilizeRunningTaskParts(messages: unknown[]): void {
   }
 }
 
-export function updateFromInjectedCompletion(
+export async function updateFromInjectedCompletion(
   state: InjectionState,
   part: MessagePart,
   message: MessageWithParts,
   _messageIndex: number,
   partIndex: number,
-): BackgroundJobRecord | undefined {
+): Promise<BackgroundJobRecord | undefined> {
   if (part.type !== 'text' || typeof part.text !== 'string') {
     return undefined;
   }
@@ -716,7 +872,7 @@ export function updateFromInjectedCompletion(
     }
     return undefined;
   }
-  if (status.state !== 'completed' && status.state !== 'error') {
+  if (!isProcessableSyntheticTerminal(part.text, status)) {
     return undefined;
   }
 
@@ -826,18 +982,12 @@ export function updateFromInjectedCompletion(
     }
   }
 
-  if (deletionEpoch !== undefined && origin === undefined) {
-    failClosedSyntheticTerminal(
-      state,
-      status,
-      occurrenceId,
-      provenanceKind,
-      existing,
-      'no message.part.updated origin was observed',
-    );
-    return undefined;
-  }
-
+  // Fence-first: a remembered (possibly stale) completion occurrence must
+  // skip CLEANLY before the deletion-epoch fail-closed branch below. A
+  // known occurrence is either a duplicate in the same lifecycle or stale
+  // history from an older generation — neither may update the current
+  // board, and neither justifies poisoning the fresh generation with
+  // markStatusUncertain when its occurrence bookkeeping is absent.
   if (
     hasRememberedInjectedCompletion(
       state,
@@ -850,11 +1000,19 @@ export function updateFromInjectedCompletion(
     return undefined;
   }
 
-  if (isFailed && isLateCancelledTaskError(existing, status.state)) {
-    part.text = formatCancelledTaskStatusOutput(
-      status.taskID,
-      state.backgroundJobBoard.getResultSummary(status.taskID),
+  if (deletionEpoch !== undefined && origin === undefined) {
+    failClosedSyntheticTerminal(
+      state,
+      status,
+      occurrenceId,
+      provenanceKind,
+      existing,
+      'no message.part.updated origin was observed',
     );
+    return undefined;
+  }
+
+  if (isFailed && isLateCancelledTaskError(existing, status.state)) {
     log('[task-session-manager] normalized late cancelled injected failure', {
       taskID: status.taskID,
       alias: existing?.alias,
@@ -886,6 +1044,7 @@ export function updateFromInjectedCompletion(
       rememberPendingInjectedTerminalJob(state, existing.parentSessionID, {
         taskID: existing.taskID,
         generation: existing.generation,
+        terminalRevision: existing.terminalRevision,
       });
     }
     return existing;
@@ -903,17 +1062,43 @@ export function updateFromInjectedCompletion(
     return undefined;
   }
 
-  const updated = updateBackgroundJobFromOutput(
-    part.text,
-    state.backgroundJobBoard,
-    state.taskContextTracker,
+  if (!existing) return undefined;
+  // Reception deduplication is separate from terminal confirmation. A replay
+  // without an observed execution owner can only request an inspection.
+  rememberProcessedInjectedCompletion(
+    state,
+    status.taskID,
+    occurrenceId,
+    provenanceKind,
+    {
+      taskID: existing.taskID,
+      generation: existing.generation,
+      lifecycleEpoch: state.getLifecycleEpoch?.() ?? 0,
+    },
   );
+  const result = await state.terminalGate.reconcile(
+    existing,
+    origin?.generationAtObservation === existing.generation
+      ? {
+          kind: 'output',
+          status,
+          origin: {
+            kind: 'synthetic',
+            occurrenceID: occurrenceId,
+            run: existing,
+            provenance: provenanceKind,
+          },
+        }
+      : { kind: 'inspect' },
+  );
+  const updated = result.kind === 'stale' ? undefined : result.record;
   if (!updated) return undefined;
 
   if (updated.terminalUnreconciled && updated.parentSessionID) {
     rememberPendingInjectedTerminalJob(state, updated.parentSessionID, {
       taskID: updated.taskID,
       generation: updated.generation,
+      terminalRevision: updated.terminalRevision,
     });
   }
 
@@ -973,7 +1158,7 @@ export function isMissingRememberedSessionError(output: string): boolean {
 }
 
 function executionKey(execution: BackgroundJobExecution): string {
-  return `${execution.taskID}\u001f${execution.generation}`;
+  return `${execution.taskID}\u001f${execution.generation}\u001f${execution.terminalRevision}`;
 }
 
 function sameExecutionIdentity(
@@ -1004,7 +1189,11 @@ function reconcileExecutionBatch(
 ): void {
   for (const execution of executions) {
     const current = state.backgroundJobBoard.get(execution.taskID);
-    if (!current || current.generation !== execution.generation) {
+    if (
+      !current ||
+      current.generation !== execution.generation ||
+      current.terminalRevision !== execution.terminalRevision
+    ) {
       log('[task-session-manager] skipped stale terminal execution', {
         parentSessionID,
         execution,
@@ -1012,7 +1201,22 @@ function reconcileExecutionBatch(
       });
       continue;
     }
-    state.backgroundJobBoard.markReconciled(execution.taskID);
+    const reconciled = state.backgroundJobBoard.markReconciled(
+      execution.taskID,
+      undefined,
+      execution.generation,
+      execution.terminalRevision,
+    );
+    // The parent has now consumed this terminal report. Remember the run
+    // so a later reopen-to-running (child session busy again) can be
+    // corrected with exactly one trailing notice.
+    if (reconciled) {
+      rememberReportedTerminalRun(state, parentSessionID, {
+        taskID: execution.taskID,
+        generation: execution.generation,
+        terminalState: reconciled.terminalState ?? reconciled.state,
+      });
+    }
   }
 }
 
@@ -1174,34 +1378,88 @@ function injectLatestBoard(state: InjectionState, messages: unknown[]): void {
   // (internal-initiator turn, empty board): an already-sent board must stay put
   // regardless of the current turn. The current tail anchor is skipped — its
   // board is (re)placed fresh below.
-  if (sessionID !== undefined) {
-    replayRetainedTailBoards(state, sessionID, messages, anchorId);
-  }
+  const lastComplete =
+    sessionID !== undefined
+      ? replayRetainedTailBoards(state, sessionID, messages, anchorId)
+      : undefined;
 
   if (!trigger) return;
   if (trigger.info.agent && trigger.info.agent !== 'orchestrator') return;
   if (!sessionID || !state.shouldManageSession(sessionID)) return;
+
+  // Corrective notices are appended in the volatile tail zone before board
+  // placement. With an assistant anchor the board follows the notice.
+  deliverReopenCorrections(state, sessionID, messages, trigger.info);
+
   if (!anchor) return;
 
-  const shapeKey = promptShapeKey(realMessages(messages, state.metadataKey));
-  reconcileConsumedTerminalJobs(state, sessionID, shapeKey);
-
-  const boardMeta =
-    state.backgroundJobBoard.formatForPromptWithMetadata(sessionID);
-  const reminder = boardMeta?.text;
-  if (!reminder) return;
+  // Hash the real history only when a prior terminal delivery needs
+  // reconciliation or a new one is about to be registered.
+  let shapeKey: string | undefined;
+  if (state.terminalJobsInjectedByParent.has(sessionID)) {
+    shapeKey = promptShapeKey(realMessages(messages, state.metadataKey));
+    reconcileConsumedTerminalJobs(state, sessionID, shapeKey);
+  }
 
   const textPart = trigger.parts.find(
     (part) => part.type === 'text' && typeof part.text === 'string',
   );
   if (!textPart || isInternalInitiatorPart(textPart)) return;
 
-  rememberInjectedTerminalJobs(
-    state,
-    sessionID,
-    boardMeta.terminalUnreconciledTaskIDs,
-    shapeKey,
-  );
+  if (state.boardInjection === false) {
+    // Board injection disabled: the native background notifier owns
+    // completed/error delivery (first publications are native-owned on
+    // both hosts), so no board part is placed — but those terminal jobs
+    // still register against the current prompt shape so the consumption
+    // reconciliation above keeps retiring them on the parent's next real
+    // activity. Without this, the store stays "completed"/unreconciled
+    // forever and every hasTerminalUnreconciled consumer wedges: explicit
+    // task-id resumes are refused, same-objective dispatches stay
+    // deduplicated, and delegated-work detection never settles.
+    //
+    // Stopped jobs are EXCLUDED: the native notifier never delivers a stop
+    // (it only injects completed/error results), so registering one here
+    // would mark it reconciled before the parent has seen it — the
+    // stopped-job recovery wake's isCurrent check would then drop it and
+    // the stop would be silent. A stopped job retires through the
+    // recovery flow instead: the wake surfaces it, and `task_revive`'s
+    // ack (or the recovery it performs) clears the flag, keeping the
+    // same-objective dispatch safeguard active until actual recovery.
+    const nativeExecutions = (
+      state.backgroundJobBoard.formatForPromptWithMetadata(sessionID)
+        ?.terminalUnreconciledTaskIDs ?? []
+    ).filter((execution) => {
+      const record = state.backgroundJobBoard.get(execution.taskID);
+      return (
+        record !== undefined &&
+        record.generation === execution.generation &&
+        record.state !== 'stopped'
+      );
+    });
+    if (nativeExecutions.length > 0) {
+      rememberInjectedTerminalJobs(
+        state,
+        sessionID,
+        nativeExecutions,
+        shapeKey ?? promptShapeKey(realMessages(messages, state.metadataKey)),
+      );
+    }
+    return;
+  }
+
+  const boardMeta =
+    state.backgroundJobBoard.formatForPromptWithMetadata(sessionID);
+  const reminder = boardMeta?.text;
+  if (!reminder) return;
+
+  if (boardMeta.terminalUnreconciledTaskIDs.length > 0) {
+    rememberInjectedTerminalJobs(
+      state,
+      sessionID,
+      boardMeta.terminalUnreconciledTaskIDs,
+      shapeKey ?? promptShapeKey(realMessages(messages, state.metadataKey)),
+    );
+  }
 
   // Placement rules — correctness first, then prompt-cache safety.
   //
@@ -1244,8 +1502,13 @@ function injectLatestBoard(state: InjectionState, messages: unknown[]): void {
   //   so the message carrying board text is genuinely user-role (A3).
   const recordId = anchor.id;
   if (canCarryBoardPart(anchor.message)) {
+    const unchanged =
+      boardMeta.terminalUnreconciledTaskIDs.length === 0 &&
+      lastComplete?.text === reminder &&
+      lastComplete.markersSince < MAX_UNCHANGED_MARKERS;
+    const text = unchanged ? UNCHANGED_BOARD_MARKER : reminder;
     appendTaggedSyntheticPart(anchor.message, {
-      text: reminder,
+      text,
       metadataKey: state.metadataKey,
     });
     // Recording the placement under the tail's anchor id lets the NEXT request
@@ -1253,15 +1516,14 @@ function injectLatestBoard(state: InjectionState, messages: unknown[]): void {
     // so the bytes the provider just cached for this message never change.
     rememberTailBoard(state, sessionID, {
       anchorId: recordId,
-      anchorRole: 'user',
-      text: reminder,
+      text,
     });
   } else {
     appendTrailingVolatileMessage(
       messages,
       {
         ...trigger.info,
-        id: `${trigger.info.id ?? 'board'}-background-job-board`,
+        id: `${trigger.info.id ?? 'board'}-background-job-board-${djb2Hash(reminder)}`,
       },
       {
         text: reminder,
@@ -1433,15 +1695,18 @@ function forgetTailBoard(
  * (compaction, revert) are pruned — their bytes are gone from the provider's
  * view too. Replay is skipped when the anchor already carries a board, keeping
  * the operation idempotent under repeated transforms on a shared array.
+ * Returns the last complete board still present and its subsequent marker
+ * count. Orphan markers are discarded if their full reference is absent.
  */
 function replayRetainedTailBoards(
   state: InjectionState,
   sessionID: string,
   messages: unknown[],
   currentAnchorId: string | undefined,
-): void {
+): { text: string; markersSince: number } | undefined {
   const perSession = state.retainedTailBoards.get(sessionID);
   if (!perSession || perSession.size === 0) return;
+  let lastComplete: { text: string; markersSince: number } | undefined;
 
   const anchorById = new Map<string, MessageWithParts>();
   for (const anchor of boardAnchors(messages, state.metadataKey)) {
@@ -1458,30 +1723,39 @@ function replayRetainedTailBoards(
       // Anchor gone from history (compaction/revert): its bytes are no longer
       // in the provider's view, so stop tracking it.
       perSession.delete(anchorId);
+      if (board.text !== UNCHANGED_BOARD_MARKER) lastComplete = undefined;
       continue;
     }
-    if (hasTaggedPart(anchor, state.metadataKey)) continue;
 
-    // A5: only the trailing-PART-on-a-user-anchor placement is replayable. A
-    // board recorded against an assistant anchor (legacy state from an earlier
-    // build) was reproduced by splicing a synthetic message after the anchor —
-    // which lands between an assistant `task` tool_call and its tool_result and
-    // invalidates the whole request. A board whose anchor is no longer a user
-    // message cannot take the part path either. Both are dropped: one lost
-    // board (a bounded cache bust on that message) is preferable to a hard
-    // AI_InvalidPromptError on every request.
-    if (board.anchorRole !== 'user' || !canCarryBoardPart(anchor)) {
+    // A5: a board whose anchor is no longer a user message cannot take the
+    // replayable trailing-part path. Drop it rather than invalidating the turn.
+    if (!canCarryBoardPart(anchor)) {
+      perSession.delete(anchorId);
+      if (board.text !== UNCHANGED_BOARD_MARKER) lastComplete = undefined;
+      continue;
+    }
+    if (board.text === UNCHANGED_BOARD_MARKER && !lastComplete) {
+      // Its full reference was pruned by compaction/revert; never replay an
+      // orphan marker into the new history.
       perSession.delete(anchorId);
       continue;
     }
 
-    appendTaggedSyntheticPart(anchor, {
-      text: board.text,
-      metadataKey: state.metadataKey,
-    });
+    if (!hasTaggedPart(anchor, state.metadataKey)) {
+      appendTaggedSyntheticPart(anchor, {
+        text: board.text,
+        metadataKey: state.metadataKey,
+      });
+    }
+    if (board.text === UNCHANGED_BOARD_MARKER) {
+      if (lastComplete) lastComplete.markersSince += 1;
+    } else {
+      lastComplete = { text: board.text, markersSince: 0 };
+    }
   }
 
   if (perSession.size === 0) state.retainedTailBoards.delete(sessionID);
+  return lastComplete;
 }
 
 /**
@@ -1543,11 +1817,58 @@ function injectCheckpointBoard(
   if (canSurface) reconcileConsumedTerminalJobs(state, sessionID, shapeKey);
 
   const boardMeta =
-    state.backgroundJobBoard.formatForPromptWithMetadata(sessionID);
+    state.boardInjection === false
+      ? undefined
+      : state.backgroundJobBoard.formatForPromptWithMetadata(sessionID);
   const reminder = boardMeta?.text;
-  const canCreateSnapshot = canSurface && reminder !== undefined;
+  const canCreateSnapshot =
+    canSurface &&
+    reminder !== undefined &&
+    !hasPendingToolResults(currentMessages);
 
   const replayBaseMessage = triggeringMessage ?? tailMessage;
+
+  if (state.boardInjection === false) {
+    // Board injection disabled (see injectLatestBoard for the full
+    // rationale): register natively delivered terminal jobs against the
+    // current prompt shape so consumption reconciliation keeps retiring
+    // them, then stop — no snapshot exists to place or replay in this
+    // mode. Only completed/error executions register: the native
+    // notifier never delivers stops, and a stop must survive until the
+    // stopped-job recovery wake surfaces it and task_revive's ack
+    // retires it (#1314 keeps board-flavored notices off in this mode).
+    if (canSurface) {
+      const nativeExecutions = (
+        state.backgroundJobBoard.formatForPromptWithMetadata(sessionID)
+          ?.terminalUnreconciledTaskIDs ?? []
+      ).filter((execution) => {
+        const record = state.backgroundJobBoard.get(execution.taskID);
+        return (
+          record !== undefined &&
+          record.generation === execution.generation &&
+          record.state !== 'stopped'
+        );
+      });
+      if (nativeExecutions.length > 0) {
+        rememberInjectedTerminalJobs(
+          state,
+          sessionID,
+          nativeExecutions,
+          shapeKey,
+        );
+      }
+    }
+    // Reopen corrections are staleness notices, not board status — they
+    // deliver in the board-less variant here (see
+    // formatReopenCorrectionTextNoBoard).
+    deliverReopenCorrections(
+      state,
+      sessionID,
+      messages,
+      replayBaseMessage.info,
+    );
+    return;
+  }
   const snapshotState = updateBoardHistoryState(
     state,
     sessionID,
@@ -1573,7 +1894,7 @@ function injectCheckpointBoard(
       }
       snapshotState.snapshots.push({
         anchorKey,
-        id: `oh-my-opencode-slim:background-job-board:${encodedSessionID}:${sequence}`,
+        id: `oh-my-opencode-slim:background-job-board:${encodedSessionID}:${snapshotState.epoch}:${sequence}`,
         text: reminder,
         terminalUnreconciledTaskIDs: boardMeta.terminalUnreconciledTaskIDs,
       });
@@ -1590,6 +1911,36 @@ function injectCheckpointBoard(
   if (replayedIDs.length > 0) {
     rememberInjectedTerminalJobs(state, sessionID, replayedIDs, shapeKey);
   }
+
+  // Corrective notices for reconciled jobs that reopened to running ride
+  // at the very end of the payload (cache-safe trailing volatile zone).
+  // Delivered on internal-initiator turns too — a publication wake makes
+  // the parent run on an internal trigger, and the correction is exactly
+  // what that turn needs (the fresh snapshot is what internal turns lack).
+  deliverReopenCorrections(state, sessionID, messages, replayBaseMessage.info);
+}
+
+/** Defer new boards until the latest tool-call batch has all its results. */
+function hasPendingToolResults(messages: MessageWithParts[]): boolean {
+  const assistantIndex = messages.findLastIndex(
+    (message) => message.info.role === 'assistant',
+  );
+  if (assistantIndex < 0) return false;
+  const pending = new Set(
+    messages[assistantIndex].parts.flatMap((part) =>
+      part.type === 'tool-call' && typeof part.toolCallId === 'string'
+        ? [part.toolCallId]
+        : [],
+    ),
+  );
+  for (const message of messages.slice(assistantIndex + 1)) {
+    for (const part of message.parts) {
+      if (part.type === 'tool-result' && typeof part.toolCallId === 'string') {
+        pending.delete(part.toolCallId);
+      }
+    }
+  }
+  return pending.size > 0;
 }
 
 function findLastMessageAnchorKey(
@@ -1709,11 +2060,23 @@ function updateBoardHistoryState(
 ): RetainedBoardSnapshotState {
   const previous = state.retainedBoardSnapshots.get(sessionID);
   if (previous && hasCompacted(previous, messages)) {
-    state.retainedBoardSnapshots.delete(sessionID);
+    const currentAnchorKeys = messageAnchorKeys(messages);
+    // Anonymous anchor keys carry an occurrence index, so when identical
+    // anonymous messages are pruned the survivor inherits the removed
+    // message's key. Only id-backed anchors are stable enough to retain.
+    previous.snapshots = previous.snapshots.filter(
+      (snapshot) =>
+        snapshot.anchorKey.startsWith('id:') &&
+        currentAnchorKeys.includes(snapshot.anchorKey),
+    );
+    if (previous.snapshots.length === 0) {
+      state.retainedBoardSnapshots.delete(sessionID);
+    }
   }
 
   const current = state.retainedBoardSnapshots.get(sessionID) ?? {
     snapshots: [],
+    epoch: randomBytes(4).toString('hex'),
     nextSnapshotSequence: 0,
     realMessageCount: 0,
     firstRealMessageAnchorKey: undefined,

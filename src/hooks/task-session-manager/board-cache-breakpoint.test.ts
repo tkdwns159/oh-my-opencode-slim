@@ -27,7 +27,7 @@
  */
 import { describe, expect, mock, test } from 'bun:test';
 import { DEFAULT_MAX_RETAINED_SNAPSHOTS } from '../../config/constants';
-import { BackgroundJobBoard } from '../../utils';
+import { BackgroundJobBoard } from '../../utils/background-job-fixture';
 import {
   BACKGROUND_JOB_BOARD_METADATA_KEY,
   createTaskSessionManagerHook,
@@ -118,7 +118,7 @@ async function inject(
 
 type Msg = {
   info: { role: string; id?: string };
-  parts: { metadata?: Record<string, unknown> }[];
+  parts: { metadata?: Record<string, unknown>; text?: string }[];
 };
 
 /**
@@ -416,9 +416,12 @@ describe('background job board cache breakpoint stability', () => {
     ]);
 
     // The first anonymous message is the same append-stable anchor, while the
-    // second occurrence receives the fresh tail board.
+    // second occurrence receives an unchanged marker on the fresh tail.
     expect(JSON.stringify(secondRequest[0])).toBe(
       JSON.stringify(firstRequest[0]),
+    );
+    expect((secondRequest[1] as Msg).parts.at(-1)?.text).toContain(
+      'Background Job Board unchanged since the last full snapshot.',
     );
     expect(
       (secondRequest as Msg[]).flatMap((message) =>

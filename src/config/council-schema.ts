@@ -3,22 +3,12 @@ import {
   type CouncillorModelEntry,
   normalizeCouncillorModels,
 } from '../utils/councillor-models';
+import { ProviderModelIdSchema } from './model-id-schema';
 
 export type { CouncillorModelEntry };
 
-/**
- * Validates model IDs in "provider/model" format.
- * Inlined here to avoid circular dependency with schema.ts.
- */
-const ModelIdSchema = z
-  .string()
-  .regex(
-    /^[^/\s]+\/[^\s]+$/,
-    'Expected provider/model format (e.g. "openai/gpt-5.6-luna")',
-  );
-
 const CouncillorModelEntrySchema = z.object({
-  id: ModelIdSchema,
+  id: ProviderModelIdSchema,
   variant: z.string().optional(),
 });
 
@@ -29,11 +19,13 @@ const CouncillorModelEntrySchema = z.object({
  */
 const CouncillorModelSchema = z
   .union([
-    ModelIdSchema,
-    z.array(z.union([ModelIdSchema, CouncillorModelEntrySchema])).min(1),
+    ProviderModelIdSchema,
+    z
+      .array(z.union([ProviderModelIdSchema, CouncillorModelEntrySchema]))
+      .min(1),
   ])
   .describe(
-    'Model ID in provider/model format (e.g. "openai/gpt-5.6-luna"), or an ' +
+    'Model ID in provider/model format (e.g. "openai/gpt-6-luna"), or an ' +
       'ordered fallback chain (array of model IDs or { id, variant } entries) ' +
       'tried in order until one responds.',
   );
@@ -58,7 +50,7 @@ export const CouncillorConfigSchema = z
       .string()
       .optional()
       .describe(
-        'Optional role/guidance injected into the councillor user prompt',
+        'Optional role/guidance appended to the councillor system prompt',
       ),
   })
   .transform((c) => {
@@ -140,7 +132,7 @@ export type CouncilPreset = z.infer<typeof CouncilPresetSchema>;
  *   "council": {
  *     "presets": {
  *       "default": {
- *         "alpha": { "model": "openai/gpt-5.6-luna" },
+ *         "alpha": { "model": "openai/gpt-6-luna" },
  *         "beta":  { "model": "openai/gpt-5.3-codex" },
  *         "gamma": { "model": "google/gemini-3-pro" }
  *       }

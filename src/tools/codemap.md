@@ -8,7 +8,9 @@ Centralized tool factory and registry for the OpenCode plugin system. This direc
 - **Code intelligence tools**: AST-grep pattern matching and transformation across languages
 - **Web capabilities**: Smart web fetching with caching and secondary model processing
 - **ACP integration**: External agent protocol execution
-- **Preset switching**: On-disk preset persistence helpers used by the TUI `/preset` manager
+- **Preset switching**: On-disk preset persistence helpers used by the TUI `/preset` managers (v1 and v2); the pure editor domain lives in `src/preset-editor-domain.ts`
+- **Interview state**: `interview-submit-state.ts` persists quiet interview
+  kickoff/status/patch updates for primary agents.
 
 These tools enable agents to perform file operations, manage background tasks, and interact with external systems while maintaining security boundaries through the OpenCode tool schema. Multi-LLM council orchestration is agent-level (dynamic `councillor-<name>` subagents in `src/agents/`), not a tool.
 
@@ -29,7 +31,7 @@ Each tool is implemented as a factory function that returns a `ToolDefinition` r
 |------------|---------|----------------|
 | **Task Management** | Background task communication, cancellation, status, results, revival, and HITL continuation control | `task-message.ts`, `cancel-task.ts`, `task-status.ts`, `task-result.ts`, `task-revive.ts`, `wait-for-user.ts` |
 | **Task Policy & Activity** | Shared live-status policy and activity tracking consumed by `task_status` and event wiring | `task-policy.ts` (`summarizeTaskStatus`), `task-activity.ts` (`TaskActivityTracker`) |
-| **ACP Integration** | External agent protocol execution | `acp-run.ts`, ACP client implementation |
+| **ACP Integration** | External agent protocol execution with live progress streaming to the parent TUI (`ctx.metadata`) | `acp-run.ts`, ACP client implementation |
 | **Code Intelligence** | AST-based code manipulation | `ast-grep/` directory, `tools.ts` |
 | **Web Fetching** | Intelligent web content retrieval | `smartfetch/` directory, `tool.ts` |
 | **Preset Switching** | On-disk preset persistence for the TUI `/preset` manager | `preset-switch.ts`, TUI state integration |
@@ -43,7 +45,7 @@ Each tool is implemented as a factory function that returns a `ToolDefinition` r
 
 ### State Management
 
-- **Runtime Presets**: Preset switching (`preset-switch.ts`) persists the preset name to the user config file; the sidebar is NOT refreshed mid-session (the agent registry is unchanged until reload) — hot-swapping the agent tree during an active conversation risks context truncation, drifted prior turns, and stale subagent references
+- **Runtime Presets**: Preset switching (`preset-switch.ts`) persists the preset name (or edits) to the user config file. The agent registry is never hot-swapped mid-session; on v2 hosts the shared `src/preset-editor-domain.ts` helpers back both the v1 JSX editor and the v2 promise-dialog editor, and only the inference fields (`model`, `variant`, `temperature`, `options`) hot-apply to NEW child sessions (frozen before the child's first request via the awaited `session.prompt` hook — the `session.created` event consumer is only a prewarm) plus the sidebar (via `src/v2/config-watch.ts` + `src/v2/runtime-profiles.ts`); a malformed refresh (`invalid-json`/`invalid-schema`/`read-error`) is rejected before any swap so the last-known-good profiles/sidebar stay — hot-swapping the full agent tree during an active conversation risks context truncation, drifted prior turns, and stale subagent references
 - **Background Jobs**: Task communication, cancellation, status, results, and revival use a centralized job board for tracking and lifecycle coordination; `task_status` reports live-confirmed host status with explicit uncertainty when the live read is unavailable
 
 ## Flow
@@ -82,8 +84,9 @@ Each tool is implemented as a factory function that returns a `ToolDefinition` r
 2. Orchestrator invokes task_message
    ├─> Resolves task_id to a live BackgroundJobBoard entry
    ├─> Acquires a generation-scoped message lease
-   ├─> Queues a bounded no-reply message without interrupting or resuming the child
-   └─> Returns transport-confirmed queue status
+   ├─> For v2 steering, verifies the tracked queued revival's exact user prompt is in the host transcript; absence or unreadable evidence refuses the write
+   ├─> Queues a bounded no-reply message without interrupting or resuming the child (v2: optional `delivery` — `queue` waits for an idle boundary, `steer` offers it at the next supported step boundary; acceptance ≠ consumption)
+   └─> Returns transport-confirmed queue status (v2 steer: acceptance at the next supported step boundary)
 
 3. Orchestrator invokes task_revive
    ├─> Resolves the retained BackgroundJobBoard entry
@@ -207,7 +210,7 @@ Tools Layer → Web Layer
 
 ### Configuration Integration
 
-- **ACP Agents**: Defined in `src/config/agents.ts`, consumed by `acp_run.ts`
+- **ACP Agents**: Defined in `src/config/schema.ts`, consumed by `acp_run.ts`
 - **Presets**: Defined in plugin config (`oh-my-opencode-slim.jsonc`), persisted by `preset-switch.ts` for the TUI `/preset` manager
 - **Task Status**: `task-status.ts` consumes `summarizeTaskStatus` from `task-policy.ts` and the live session-status snapshot
 
@@ -246,7 +249,7 @@ Preset switching is not a tool: `preset-switch.ts` exposes on-disk helpers
 
 
 #### ACP Agents (acp-run.ts)
-- Configured in `src/config/agents.ts` as `AcpAgentsConfig`
+- Configured in `src/config/schema.ts` as `AcpAgentsConfig`
 - Each agent requires: `command`, `args`, `cwd`, `permissionMode`
 - Supports: `ask` (prompt user), `reject` (auto-deny), `allow` (auto-approve)
 
@@ -258,7 +261,9 @@ Preset switching is not a tool: `preset-switch.ts` exposes on-disk helpers
 #### Presets (preset-switch.ts)
 - Defined in plugin config under `presets` field
 - Each preset maps agent names to `AgentOverrideConfig`
-- `switchPresetOnDisk` persists the preset name to the user config file; changes take effect on the next reload
+- `switchPresetOnDisk` persists the preset name to the user config file. v1
+  applies it on reload; v2 requests a live inference-profile/sidebar refresh
+  for new child sessions while existing sessions stay frozen.
 
 #### AST-grep (ast-grep/)
 - Auto-downloads CLI binary on first use

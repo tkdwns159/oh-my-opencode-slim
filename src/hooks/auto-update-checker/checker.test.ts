@@ -200,6 +200,30 @@ describe('auto-update-checker/checker', () => {
       readSpy.mockRestore();
     });
 
+    test('detects entry under the opencode2 plural `plugins` key', async () => {
+      const existsSpy = spyOn(fs, 'existsSync').mockImplementation(
+        (p: string) => p.includes('opencode.json'),
+      );
+      const readSpy = spyOn(fs, 'readFileSync').mockReturnValue(
+        JSON.stringify({
+          plugins: ['oh-my-opencode-slim@latest'],
+        }),
+      );
+
+      const { findPluginEntry } = await import(
+        `./checker?test=${importCounter++}`
+      );
+
+      const entry = findPluginEntry('/test');
+      expect(entry).not.toBeNull();
+      expect(entry?.entry).toBe('oh-my-opencode-slim@latest');
+      expect(entry?.isPinned).toBe(false);
+      expect(entry?.pinnedVersion).toBeNull();
+
+      existsSpy.mockRestore();
+      readSpy.mockRestore();
+    });
+
     test('detects pinned version entry', async () => {
       const existsSpy = spyOn(fs, 'existsSync').mockImplementation(
         (p: string) => p.includes('opencode.json'),
@@ -318,7 +342,9 @@ describe('auto-update-checker/checker', () => {
 
       const previousTuiConfig = process.env.OPENCODE_TUI_CONFIG;
       process.env.OPENCODE_TUI_CONFIG = '/mock/config/tui.json';
-      expect(updateInstallerManagedVersions('/project', '1.2.4')).toBe(true);
+      expect(updateInstallerManagedVersions('/project', '1.2.4')).toEqual({
+        status: 'changed',
+      });
       expect(files.get('/mock/config/opencode.json')).toContain(
         'oh-my-opencode-slim@1.2.4',
       );

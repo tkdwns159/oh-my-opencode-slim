@@ -105,10 +105,14 @@ oh-my-opencode-slim-companion-v0.1.3-x86_64-pc-windows-msvc.zip
 
 ## 4. Build and publish companion assets
 
-Trigger the manual workflow:
+Trigger the manual workflow from the release-prep ref that contains the
+Companion changes. Building from the prep ref lets you publish the native
+assets, copy their final digests into the manifest, and only then merge a
+self-consistent release change:
 
 ```bash
 gh workflow run companion-release.yml \
+  --ref <release-prep-branch> \
   -f version=0.1.3 \
   -f targets=macos-arm64,macos-x64,linux-x64,linux-arm64,windows-x64
 ```
@@ -141,6 +145,17 @@ Copy each asset's SHA256 digest into `src/companion/companion-manifest.json`.
 GitHub release asset metadata reports these as `digest: sha256:<hash>`; store
 only the hash value in the manifest. Then mirror the same values in the fallback
 `COMPANION_MANIFEST` constant in `src/companion/updater.ts`.
+
+Before merging the release prep or publishing the plugin, run:
+
+```bash
+bun run verify:companion-manifest
+```
+
+The verifier fails if the Rust crate version, manifest version/tag, supported
+asset names, SHA256 values, or TypeScript fallback manifest drift apart.
+`npm publish` runs the same verification through `prepublishOnly`, so a plugin
+release cannot silently ship a stale Companion manifest.
 
 ### Manual companion upload fallback
 
@@ -190,7 +205,25 @@ If you have not manually edited the version, use npm's version command instead:
 npm version patch
 ```
 
-That creates the version commit and `v<version>` tag automatically.
+That creates the version commit and annotated `v<version>` tag automatically.
+The package's `version` lifecycle hook runs after npm updates `package.json` but
+before npm creates the commit and tag. It force-regenerates
+`src/generated/build-info.ts` with the new package version and stages it, so the
+version commit and tag both point to the commit containing the generated stamp.
+The hook does not amend or otherwise rewrite the commit after tagging.
+
+For the automatic patch release chain, `bun run release:patch` runs
+`npm version patch`, pushes the current branch and its annotated version tag
+with `git push --follow-tags`, then publishes to npm. Review the pending release
+changes and ensure the working tree is clean before running it; this command
+performs both the push and npm publish. The `release:minor`, `release:major`,
+`release:beta`, and `release:beta:next` scripts follow the same sequence with
+their respective npm version and publish tags.
+
+If you bumped the version manually, run `bun run gen:build-info` (the version
+change triggers the rewrite) and include the generated file in the version
+commit. Ordinary `bun run build` runs leave the committed stamp untouched, so
+building never dirties the git tree.
 
 ## 6. Verify before tagging or publishing
 
@@ -201,6 +234,7 @@ bun run check:ci
 bun run typecheck
 bun test
 bun run build
+bun run verify:companion-manifest
 ```
 
 CI installs the Bun version pinned by `packageManager` in `package.json` and
@@ -209,10 +243,6 @@ CI uploads JUnit and LCOV reports. A non-blocking latest-Bun canary reports
 upcoming runtime incompatibilities, package smoke runs for package-affecting
 pull requests, and the scheduled OpenCode compatibility workflow checks both
 the pinned supported host and latest host canary.
-
-### Skill Synchronization Hashes Gate
-
-If this release changes any bundled skill content (under `src/skills/`), you must populate the `LEGACY_MANAGED_SKILL_HASHES` table in `src/hooks/auto-update-checker/skill-sync.ts` with the hashes of the previously published versions of those skills (obtained from published npm package tarballs). This ensures existing users' installations are adopted and upgraded safely. If this is a migration-only release without skill changes, confirm the table is kept as-is.
 
 Before committing or tagging, inspect:
 
@@ -315,5 +345,6 @@ For the `2.0.3` / `companion-v0.1.3` release, the completed state should be:
 - GitHub release `v2.0.3` exists.
 - GitHub release `companion-v0.1.3` exists with the expected assets.
 - Working tree is clean.
-- `bun run check:ci`, `bun run typecheck`, `bun test`, and `bun run build` pass.
+- `bun run check:ci`, `bun run typecheck`, `bun test`, `bun run build`, and
+  `bun run verify:companion-manifest` pass.
 - npm publish is run only after the GitHub release and companion assets are ready.

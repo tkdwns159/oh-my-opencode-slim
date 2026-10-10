@@ -10,8 +10,9 @@ import {
   readDashboardAuthFile,
   tryBecomeDashboard,
 } from './dashboard';
+import { interviewOwnerSessionID } from './document';
 import type { InterviewSessionRuntime } from './runtime';
-import { createInterviewServer } from './server';
+import { createInterviewServer, createInterviewServerDeps } from './server';
 import { createInterviewService } from './service';
 import type {
   InterviewRecord,
@@ -32,7 +33,10 @@ export function createDashboardManager(
   } = {},
 ): {
   service: ReturnType<typeof createInterviewService>;
-  registerCommand: (config: Record<string, unknown>) => void;
+  registerCommand: (
+    config: Record<string, unknown>,
+    enabled?: { interview?: boolean; implement?: boolean },
+  ) => void;
   handleCommandExecuteBefore: (
     input: { command: string; sessionID: string; arguments: string },
     output: { parts: Array<{ type: string; text?: string }> },
@@ -265,7 +269,7 @@ export function createDashboardManager(
           if (disposed) return;
           dashboard?.pushState({
             interviewId: interview.id,
-            sessionID: interview.sessionID,
+            sessionID: interviewOwnerSessionID(interview),
             idea: interview.idea,
             mode: 'awaiting-agent',
             summary: 'Interview created.',
@@ -280,7 +284,7 @@ export function createDashboardManager(
           });
           // Register session directory for file scanning
           dashboard?.registerSession({
-            sessionID: interview.sessionID,
+            sessionID: interviewOwnerSessionID(interview),
             directory: ctx.directory,
             pid: process.pid,
             registeredAt: Date.now(),
@@ -371,21 +375,9 @@ export function createDashboardManager(
       // service, exactly like the non-dashboard mode would.
       isDashboard = false;
       const resolvedOutputPath = path.join(ctx.directory, outputFolder);
-      fallbackServer = createInterviewServer({
-        getState: async (interviewId) => service.getInterviewState(interviewId),
-        listInterviewFiles: async () => service.listInterviewFiles(),
-        listInterviews: () => service.listInterviews(),
-        submitAnswers: async (interviewId, answers) =>
-          service.submitAnswers(interviewId, answers),
-        submitBlockComment: async (interviewId, section, comment) =>
-          service.submitBlockComment(interviewId, section, comment),
-        submitChat: async (interviewId, message) =>
-          service.submitChat(interviewId, message),
-        handleNudgeAction: async (interviewId, action) =>
-          service.handleNudgeAction(interviewId, action),
-        outputFolder: resolvedOutputPath,
-        port: 0,
-      });
+      fallbackServer = createInterviewServer(
+        createInterviewServerDeps(service, resolvedOutputPath, 0),
+      );
       service.setBaseUrlResolver(
         () =>
           fallbackServer?.ensureStarted() ??
@@ -595,7 +587,7 @@ export function createDashboardManager(
 
   return {
     service,
-    registerCommand: (c) => service.registerCommand(c),
+    registerCommand: (c, enabled) => service.registerCommand(c, enabled),
     handleCommandExecuteBefore: async (input, output) => {
       await ensureInitialized();
       if (disposed) return;
@@ -928,7 +920,7 @@ function stateToEntry(
 ): InterviewStateEntry {
   return {
     interviewId,
-    sessionID: state.interview.sessionID,
+    sessionID: interviewOwnerSessionID(state.interview),
     idea: state.interview.idea,
     mode: state.mode,
     summary: state.summary,
@@ -987,7 +979,7 @@ async function registerInterviewViaHttp(
     },
     body: JSON.stringify({
       interviewId: interview.id,
-      sessionID: interview.sessionID,
+      sessionID: interviewOwnerSessionID(interview),
       idea: interview.idea,
       mode: 'awaiting-agent',
       summary: 'Interview created.',

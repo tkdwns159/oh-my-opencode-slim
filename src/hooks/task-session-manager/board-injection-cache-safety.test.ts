@@ -5,7 +5,7 @@
  * Empirical verification of the checkpoint-compatible board strategy's
  * cache behavior (fix/checkpoint-cache-epochs investigation). Simulates a
  * multi-turn orchestrator tool loop with realistic SDK-shaped message
- * fixtures (github-copilot / gpt-5.6-luna) and measures, per turn:
+ * fixtures (github-copilot / gpt-6-luna) and measures, per turn:
  *
  *  1. transform-level bytes: the exact `messages` array the hook produces
  *  2. provider-level bytes: those messages passed through the same
@@ -25,7 +25,8 @@
  */
 import { describe, expect, mock, test } from 'bun:test';
 import { DEFAULT_MAX_RETAINED_SNAPSHOTS } from '../../config/constants';
-import { BackgroundJobBoard, createInternalAgentTextPart } from '../../utils';
+import { createInternalAgentTextPart } from '../../utils';
+import { BackgroundJobBoard } from '../../utils/background-job-fixture';
 import { createTaskSessionManagerHook } from './index';
 
 const SESSION = 'ses_08f6be16dffednbwYD8dNDIfOI';
@@ -41,7 +42,7 @@ function userMsg(id: string, text: string, createdAt: number) {
       role: 'user',
       time: { created: createdAt },
       agent: 'orchestrator',
-      model: { providerID: 'github-copilot', modelID: 'gpt-5.6-luna' },
+      model: { providerID: 'github-copilot', modelID: 'gpt-6-luna' },
     },
     parts: [
       {
@@ -83,7 +84,7 @@ function assistantMsg(
       role: 'assistant',
       time: { created: createdAt, completed: createdAt + 4321 },
       parentID: 'msg_u1',
-      modelID: 'gpt-5.6-luna',
+      modelID: 'gpt-6-luna',
       providerID: 'github-copilot',
       mode: 'orchestrator',
       path: { cwd: '/work/repo', root: '/work/repo' },
@@ -207,7 +208,7 @@ function describeTransition(label: string, prev: string, next: string) {
 
 // ── Hook + turn runner ────────────────────────────────────────────────
 
-function createHook(board: BackgroundJobBoard) {
+function createHook(board: BackgroundJobBoard, boardInjection?: boolean) {
   return createTaskSessionManagerHook(
     {
       client: { session: { status: mock(async () => ({ data: {} })) } },
@@ -218,6 +219,7 @@ function createHook(board: BackgroundJobBoard) {
       maxSessionsPerAgent: 4,
       maxRetainedSnapshots: DEFAULT_MAX_RETAINED_SNAPSHOTS,
       strategy: 'checkpoint-compatible',
+      boardInjection,
       backgroundJobBoard: board,
       shouldManageSession: () => true,
     },
@@ -508,4 +510,190 @@ describe('checkpoint-compatible board cache safety', () => {
       );
     }
   }, 20_000);
+
+  // ── Compaction keeps snapshots whose anchors survive (#1457) ──────────
+
+  test('keeps retained snapshots whose anchors survive a compaction', async () => {
+    const board = new BackgroundJobBoard();
+    board.registerLaunch({
+      taskID: 'child-1',
+      parentSessionID: SESSION,
+      agent: 'explorer',
+      description: 'map scheduler hooks',
+    });
+    const hook = createHook(board);
+
+    const history: unknown[] = [
+      userMsg('msg_u1', 'Coordinate the refactor work', BASE_TIME),
+    ];
+    await runTurn(hook, history);
+
+    history.push(
+      assistantMsg('msg_a1', 'step', BASE_TIME + 30_000, 0.01, 5000),
+    );
+    history.push(userMsg('msg_u2', 'Continue', BASE_TIME + 60_000));
+    board.registerLaunch({
+      taskID: 'child-2',
+      parentSessionID: SESSION,
+      agent: 'oracle',
+      description: 'review plan',
+    });
+    await runTurn(hook, history);
+
+    history.push(
+      assistantMsg('msg_a2', 'more', BASE_TIME + 90_000, 0.02, 7000),
+    );
+    history.push(userMsg('msg_u3', 'Keep going', BASE_TIME + 120_000));
+    board.registerLaunch({
+      taskID: 'child-3',
+      parentSessionID: SESSION,
+      agent: 'librarian',
+      description: 'look up docs',
+    });
+    const before = await runTurn(hook, history);
+    const boardIDs = (r: TurnResult) =>
+      summarizeInjected(r.injected as never).filter((s) =>
+        s.startsWith('BOARD('),
+      );
+    expect(boardIDs(before).length).toBe(3);
+
+    // Compaction: the oldest messages disappear, later anchors remain.
+    const compacted = history.slice(2);
+    const after = await runTurn(hook, compacted);
+
+    // Snapshots anchored on surviving messages must be replayed unchanged
+    // (same id, so same epoch and sequence), not purged into a new epoch.
+    const surviving = boardIDs(before).slice(1);
+    expect(boardIDs(after)).toEqual(surviving);
+
+    // The provider-visible prompt (text and snapshot placement among real
+    // messages) must also be unchanged for the surviving suffix.
+    const visible = (r: TurnResult) => {
+      const items = r.injected as any[];
+      const start = items.findIndex((m) => m.info.id === 'msg_u2');
+      const end = items.findIndex((m) => m.info.id === 'msg_u3');
+      return serializeMessages(items.slice(start, end));
+    };
+    expect(visible(after)).toBe(visible(before));
+  }, 20_000);
+
+  test('does not replay a removed anonymous message snapshot after pruning duplicates', async () => {
+    const board = new BackgroundJobBoard();
+    board.registerLaunch({
+      taskID: 'child-1',
+      parentSessionID: SESSION,
+      agent: 'explorer',
+      description: 'map scheduler hooks',
+    });
+    const hook = createHook(board);
+    const anon = (t: number) => {
+      const m = userMsg('x', 'Continue', t) as any;
+      delete m.info.id;
+      return m;
+    };
+
+    const history: unknown[] = [anon(BASE_TIME)];
+    await runTurn(hook, history);
+    history.push(anon(BASE_TIME + 30_000));
+    board.registerLaunch({
+      taskID: 'child-2',
+      parentSessionID: SESSION,
+      agent: 'oracle',
+      description: 'review plan',
+    });
+    const before = await runTurn(hook, history);
+    const ids = (r: TurnResult) =>
+      summarizeInjected(r.injected as never).filter((s) =>
+        s.startsWith('BOARD('),
+      );
+    expect(ids(before).length).toBe(2);
+
+    // Drop the first identical message; the survivor must not inherit the
+    // removed message's snapshot.
+    const after = await runTurn(hook, history.slice(1));
+    expect(ids(after)).not.toContain(ids(before)[0]);
+  }, 20_000);
+});
+
+describe('backgroundJobs.boardInjection switch (#1314 thread)', () => {
+  test('off: checkpoint strategy injects no board text at all', async () => {
+    const board = new BackgroundJobBoard();
+    board.registerLaunch({
+      taskID: 'child-1',
+      parentSessionID: SESSION,
+      agent: 'explorer',
+      description: 'map hooks',
+    });
+    const hook = createHook(board, false);
+    const turn = await runTurn(hook, [
+      userMsg('msg_u_sw_off', 'Coordinate the refactor work', BASE_TIME),
+    ]);
+    expect(turn.transformBytes).not.toContain('Background Job Board');
+  });
+
+  test('on (default): checkpoint strategy keeps injecting the board', async () => {
+    const board = new BackgroundJobBoard();
+    board.registerLaunch({
+      taskID: 'child-1',
+      parentSessionID: SESSION,
+      agent: 'explorer',
+      description: 'map hooks',
+    });
+    const hook = createHook(board);
+    const turn = await runTurn(hook, [
+      userMsg('msg_u_sw_on', 'Coordinate the refactor work', BASE_TIME),
+    ]);
+    expect(turn.transformBytes).toContain('Background Job Board');
+  });
+
+  test('off: checkpoint strategy registers completed jobs but never stopped ones', async () => {
+    const board = new BackgroundJobBoard();
+    board.registerLaunch({
+      taskID: 'child-done',
+      parentSessionID: SESSION,
+      agent: 'explorer',
+      description: 'map hooks',
+    });
+    board.updateStatus({
+      taskID: 'child-done',
+      state: 'completed',
+      resultSummary: 'done',
+    });
+    board.registerLaunch({
+      taskID: 'child-stopped',
+      parentSessionID: SESSION,
+      agent: 'explorer',
+      description: 'map hooks',
+    });
+    board.updateStatus({
+      taskID: 'child-stopped',
+      state: 'stopped',
+      resultSummary: 'stopped without a terminal result',
+    });
+    const hook = createHook(board, false);
+
+    // First real turn: the completed job registers for consumption; the
+    // stopped job must not (the recovery wake owns its delivery).
+    await runTurn(hook, [
+      userMsg('msg_u_off_1', 'Coordinate the refactor work', BASE_TIME),
+    ]);
+    expect(board.getState('child-done')).toBe('completed');
+    expect(board.getState('child-stopped')).toBe('stopped');
+    expect(board.get('child-stopped')).toMatchObject({
+      terminalUnreconciled: true,
+    });
+
+    // Second real turn with an advanced prompt shape retires only the
+    // completed job; the stopped job stays for the recovery flow.
+    await runTurn(hook, [
+      userMsg('msg_u_off_1', 'Coordinate the refactor work', BASE_TIME),
+      assistantMsg('msg_a_off_1', 'consumed the result', BASE_TIME + 1),
+      userMsg('msg_u_off_2', 'next step', BASE_TIME + 2),
+    ]);
+    expect(board.getState('child-done')).toBe('reconciled');
+    expect(board.getState('child-stopped')).toBe('stopped');
+    expect(board.get('child-stopped')).toMatchObject({
+      terminalUnreconciled: true,
+    });
+  });
 });

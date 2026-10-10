@@ -1,31 +1,23 @@
 #!/usr/bin/env node
 import { doctor, parseDoctorArgs } from './doctor';
 import { install } from './install';
+import { runMarketplaceCommand } from './marketplace';
 import { getGeneratedPresetNames, isGeneratedPresetName } from './providers';
 import type {
   BackgroundSubagentsArg,
   CompanionArg,
   InstallArgs,
-  SkillsArg,
 } from './types';
 
 export function parseArgs(args: string[]): InstallArgs {
   const result: InstallArgs = {
     tui: true,
-    skills: 'yes',
     companion: 'ask',
   };
 
   for (const arg of args) {
     if (arg === '--no-tui') {
       result.tui = false;
-    } else if (arg.startsWith('--skills=')) {
-      const mode = arg.split('=')[1] as SkillsArg;
-      if (!['yes', 'no', 'force'].includes(mode)) {
-        console.error('Unsupported --skills value: use yes, no, or force');
-        process.exit(1);
-      }
-      result.skills = mode;
     } else if (arg.startsWith('--companion=')) {
       const mode = arg.split('=')[1] as CompanionArg;
       if (!['ask', 'yes', 'no'].includes(mode)) {
@@ -75,10 +67,9 @@ oh-my-opencode-slim installer
 Usage:
   bunx oh-my-opencode-slim install [OPTIONS]
   bunx oh-my-opencode-slim doctor [OPTIONS]
+  bunx oh-my-opencode-slim marketplace <command> [target]
 
 Options:
-  --skills=yes|no|force  Install bundled skills; force replaces existing skill
-                         directories (default: yes)
   --companion=ask|yes|no Install desktop companion binary and enable config
                          (default: ask; prompt defaults to no)
   --preset=<name>        Active generated config preset (default: openai)
@@ -103,7 +94,7 @@ For the full config reference, see docs/configuration.md.
 
 Examples:
   bunx oh-my-opencode-slim install
-  bunx oh-my-opencode-slim install --no-tui --skills=yes
+  bunx oh-my-opencode-slim install --no-tui
   bunx oh-my-opencode-slim install --background-subagents=yes
   bunx oh-my-opencode-slim install --preset=opencode-go
   bunx oh-my-opencode-slim install --reset
@@ -123,6 +114,8 @@ async function main(): Promise<void> {
     const doctorArgs = parseDoctorArgs(args.slice(1));
     const exitCode = await doctor(doctorArgs);
     process.exit(exitCode);
+  } else if (args[0] === 'marketplace') {
+    process.exit(await runMarketplaceCommand(args.slice(1)));
   } else if (args[0] === '-h' || args[0] === '--help') {
     printHelp();
     process.exit(0);

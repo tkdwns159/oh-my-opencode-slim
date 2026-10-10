@@ -62,6 +62,34 @@ describe('RuntimeConfig', () => {
     expect(runtime.agent('explorer')?.model).toBe('plugin-file-model');
   });
 
+  test('inheritance prevents host models from leaking into agent views', () => {
+    resetRegistry();
+    const runtime = RuntimeConfig.init(DIRECTORY, {
+      agents: {
+        explorer: { inheritModelFrom: 'session' },
+        librarian: { inheritModelFrom: 'orchestrator' },
+      },
+    });
+    runtime.captureHostConfig({
+      agent: {
+        explorer: { model: 'host/explorer', temperature: 0.3 },
+        librarian: {
+          model: 'host/librarian',
+          options: { reasoningEffort: 'high' },
+        },
+      },
+    });
+
+    expect(runtime.agent('explorer')).toEqual({
+      inheritModelFrom: 'session',
+      temperature: 0.3,
+    });
+    expect(runtime.agent('librarian')).toEqual({
+      inheritModelFrom: 'orchestrator',
+      options: { reasoningEffort: 'high' },
+    });
+  });
+
   test('host snapshot is captured before mutation', () => {
     resetRegistry();
     const runtime = RuntimeConfig.init(DIRECTORY, {});
@@ -122,16 +150,30 @@ describe('RuntimeConfig', () => {
       type: 'none',
       layout: 'main-vertical',
       main_pane_size: 60,
-      zellij_pane_mode: 'agent-tab',
     });
     expect(runtime.backgroundJobs.maxSessionsPerAgent).toBe(2);
     expect(runtime.backgroundJobs.strategy).toBe('latest');
+    // v1-parity defaults: board injection and periodic wake evaluation stay
+    // enabled when no config layer sets them (v2 hosts derive otherwise at
+    // load time; RuntimeConfig itself is flavor-agnostic).
+    expect(runtime.backgroundJobs.boardInjection).toBe(true);
+    // Terminal-session GC is opt-in everywhere (no v2 default derivation).
+    expect(runtime.backgroundJobs.pruneEvictedSessions).toBe(false);
+    expect(runtime.backgroundJobs.orchestratorWake.periodicWakeEnabled).toBe(
+      true,
+    );
     expect(runtime.backgroundJobs.concurrency).toEqual({
       defaultConcurrency: 0,
       providerConcurrency: {},
       modelConcurrency: {},
     });
-    expect(runtime.fallback).toEqual({ enabled: true, maxRetries: 3 });
+    expect(runtime.fallback).toEqual({
+      enabled: true,
+      maxRetries: 3,
+      initialRetryDelayMs: 0,
+      retryDelayMs: 500,
+      continuationPolicy: 'retry-primary',
+    });
     expect(runtime.webfetch.enabled).toBe(true);
     expect(runtime.acpAgents).toEqual({});
     expect(runtime.companion).toBeUndefined();
@@ -148,6 +190,8 @@ describe('RuntimeConfig', () => {
     expect(runtime.hostMcp()).toBeUndefined();
     expect(runtime.getRuntimePreset()).toBeNull();
     expect(runtime.hasModelSwitched('explorer')).toBe(false);
+    expect(runtime.disabledHooks).toEqual(new Set());
+    expect(runtime.disabledCommands).toEqual(new Set());
   });
 
   test('explicit config values override defaults', () => {
@@ -162,6 +206,8 @@ describe('RuntimeConfig', () => {
       disabled_tools: ['webfetch'],
       disabled_mcps: ['context7'],
       disabled_skills: ['clonedeps'],
+      disabled_hooks: ['foreground-fallback'],
+      disabled_commands: ['interview', 'loop'],
       fallback: { enabled: false, maxRetries: 5 },
       webfetch: { enabled: false },
       acpAgents: { myAcp: { command: 'echo' } },
@@ -178,6 +224,8 @@ describe('RuntimeConfig', () => {
     expect(runtime.disabledTools).toEqual(['webfetch']);
     expect(runtime.disabledMcps).toEqual(['context7']);
     expect(runtime.disabledSkills).toEqual(['clonedeps']);
+    expect(runtime.disabledHooks).toEqual(new Set(['foreground-fallback']));
+    expect(runtime.disabledCommands).toEqual(new Set(['interview', 'loop']));
     expect(runtime.fallback.enabled).toBe(false);
     expect(runtime.fallback.maxRetries).toBe(5);
     expect(runtime.webfetch.enabled).toBe(false);
@@ -368,6 +416,41 @@ describe('RuntimeConfig', () => {
     ]);
   });
 
+  test('modelArrays and runtimeChains retain nested spaced IDs and variants', () => {
+    resetRegistry();
+    const runtime = RuntimeConfig.init(DIRECTORY, {
+      preset: 'spaced',
+      presets: {
+        spaced: {
+          explorer: {
+            model: [
+              {
+                id: 'opencode-omniroute-live/of/MiniMax M3',
+                variant: 'fast',
+              },
+              { id: 'of/Kimi K2.6', variant: 'balanced' },
+              'opencode-omniroute-live/of/Qwen3.8 27b',
+            ],
+          },
+        },
+      },
+    });
+
+    expect(runtime.modelArrays.explorer).toEqual([
+      {
+        id: 'opencode-omniroute-live/of/MiniMax M3',
+        variant: 'fast',
+      },
+      { id: 'of/Kimi K2.6', variant: 'balanced' },
+      { id: 'opencode-omniroute-live/of/Qwen3.8 27b' },
+    ]);
+    expect(runtime.runtimeChains.explorer).toEqual([
+      'opencode-omniroute-live/of/MiniMax M3',
+      'of/Kimi K2.6',
+      'opencode-omniroute-live/of/Qwen3.8 27b',
+    ]);
+  });
+
   test('modelArrays excludes disabled councillor seats', () => {
     resetRegistry();
     const runtime = RuntimeConfig.init(DIRECTORY, {
@@ -390,5 +473,66 @@ describe('RuntimeConfig', () => {
       },
     });
     expect(runtime.modelArrays['councillor-alpha']).toBeUndefined();
+  });
+});
+
+describe('RuntimeConfig combinedModelInheritanceSource', () => {
+  test('resolves the source for combined array + inherit policies', () => {
+    resetRegistry();
+    const runtime = RuntimeConfig.init(DIRECTORY, {
+      agents: {
+        fixer: {
+          model: ['chain/primary', 'chain/backup'],
+          inheritModelFrom: 'session',
+        },
+        librarian: {
+          model: [{ id: 'chain/primary' }],
+          inheritModelFrom: 'orchestrator',
+        },
+      },
+    } as PluginConfig);
+
+    expect(runtime.combinedModelInheritanceSource('fixer')).toBe('session');
+    expect(runtime.combinedModelInheritanceSource('librarian')).toBe(
+      'orchestrator',
+    );
+  });
+
+  test('resolves agent aliases to their canonical override', () => {
+    resetRegistry();
+    const runtime = RuntimeConfig.init(DIRECTORY, {
+      agents: {
+        explore: {
+          model: ['chain/primary'],
+          inheritModelFrom: 'session',
+        },
+      },
+    } as PluginConfig);
+
+    expect(runtime.combinedModelInheritanceSource('explorer')).toBe('session');
+  });
+
+  test('returns undefined for agents without a combined policy', () => {
+    resetRegistry();
+    const runtime = RuntimeConfig.init(DIRECTORY, {
+      agents: {
+        // Empty array: no usable chain.
+        fixer: { model: [], inheritModelFrom: 'session' },
+        // Array without an inheritance directive: fully static.
+        librarian: { model: ['chain/primary'] },
+        // Scalar model plus inheritance: explicit model wins.
+        explorer: { model: 'explorer-model', inheritModelFrom: 'session' },
+        // Inheritance without a chain: plain inherit, not combined.
+        observer: { inheritModelFrom: 'session' },
+      },
+    } as PluginConfig);
+
+    expect(runtime.combinedModelInheritanceSource('fixer')).toBeUndefined();
+    expect(runtime.combinedModelInheritanceSource('librarian')).toBeUndefined();
+    expect(runtime.combinedModelInheritanceSource('explorer')).toBeUndefined();
+    expect(runtime.combinedModelInheritanceSource('observer')).toBeUndefined();
+    expect(
+      runtime.combinedModelInheritanceSource('unconfigured-agent'),
+    ).toBeUndefined();
   });
 });

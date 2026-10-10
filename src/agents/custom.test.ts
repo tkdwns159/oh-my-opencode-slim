@@ -14,9 +14,9 @@ describe('custom-agent creation', () => {
   test('infers custom agents from unknown keys', () => {
     const config: PluginConfig = {
       agents: {
-        explorer: { model: 'openai/gpt-5.6-luna' },
+        explorer: { model: 'openai/gpt-6-luna' },
         reviewer: {
-          model: 'openai/gpt-5.6',
+          model: 'openai/gpt-6',
           prompt: 'You are the custom reviewer agent.',
         },
       },
@@ -29,7 +29,7 @@ describe('custom-agent creation', () => {
 
     const customAgent = agents.find((agent) => agent.name === 'reviewer');
     expect(customAgent).toBeDefined();
-    expect(customAgent?.config.model).toBe('openai/gpt-5.6');
+    expect(customAgent?.config.model).toBe('openai/gpt-6');
     expect(customAgent?.config.prompt).toBe(
       'You are the custom reviewer agent.',
     );
@@ -39,7 +39,7 @@ describe('custom-agent creation', () => {
     const config: PluginConfig = {
       agents: {
         'test-auditor': {
-          model: 'openai/gpt-5.6-luna',
+          model: 'openai/gpt-6-luna',
           prompt: 'You are a custom subagent for auditing.',
           orchestratorPrompt:
             '@test-auditor\n- Role: Compliance audit specialist',
@@ -91,7 +91,7 @@ describe('custom-agent creation', () => {
       disabled_agents: ['test-auditor', 'designer'],
       agents: {
         'test-auditor': {
-          model: 'openai/gpt-5.6-luna',
+          model: 'openai/gpt-6-luna',
           prompt: 'You are a disabled custom agent.',
         },
       },
@@ -109,7 +109,7 @@ describe('custom-agent creation', () => {
     const config: PluginConfig = {
       agents: {
         'unsafe/name': {
-          model: 'openai/gpt-5.6-luna',
+          model: 'openai/gpt-6-luna',
         },
       },
     };
@@ -121,7 +121,7 @@ describe('custom-agent creation', () => {
     const config: PluginConfig = {
       agents: {
         janitor: {
-          model: 'openai/gpt-5.6-luna',
+          model: 'openai/gpt-6-luna',
           orchestratorPrompt: '@cleanup\n- Role: Cleanup specialist',
         },
       },
@@ -144,7 +144,7 @@ describe('custom-agent creation', () => {
           timeoutMs: 0,
           permissionMode: 'ask',
           description: 'Claude Code research via ACP',
-          wrapperModel: 'openai/gpt-5.6-luna',
+          wrapperModel: 'openai/gpt-6-luna',
         },
       },
     };
@@ -155,7 +155,7 @@ describe('custom-agent creation', () => {
 
     expect(wrapper).toBeDefined();
     expect(wrapper?.description).toBe('Claude Code research via ACP');
-    expect(wrapper?.config.model).toBe('openai/gpt-5.6-luna');
+    expect(wrapper?.config.model).toBe('openai/gpt-6-luna');
     expect(wrapper?.config.prompt).toContain('acp_run');
     expect(orchestrator?.config.prompt).toContain('@claude-research');
   });
@@ -225,7 +225,7 @@ describe('custom-agent creation', () => {
   test('rejects acpAgents that conflict with custom agents', () => {
     const config: PluginConfig = {
       agents: {
-        bridge: { model: 'openai/gpt-5.6-luna' },
+        bridge: { model: 'openai/gpt-6-luna' },
       },
       acpAgents: {
         bridge: {
@@ -265,11 +265,11 @@ describe('custom-agent creation', () => {
     const config: PluginConfig = {
       agents: {
         explorer: {
-          model: 'openai/gpt-5.6-luna',
+          model: 'openai/gpt-6-luna',
           displayName: 'fancy-explorer',
         },
         janitor: {
-          model: 'openai/gpt-5.6',
+          model: 'openai/gpt-6',
           orchestratorPrompt:
             'Please use @janitor to clean up after @explorer has completed.',
         },
@@ -322,7 +322,7 @@ describe('custom-agent creation', () => {
     const configOnlyAcp: PluginConfig = {
       agents: {
         explorer: {
-          model: 'openai/gpt-5.6-luna',
+          model: 'openai/gpt-6-luna',
           displayName: 'fancy-explorer',
         },
       },
@@ -506,5 +506,104 @@ describe('permission edge cases', () => {
     expect(
       (orchestrator?.config.permission as Record<string, unknown>)?.task_cancel,
     ).toBeDefined();
+  });
+});
+
+describe('nested-dispatch default', () => {
+  test('custom agents deny nested dispatch by default on v2', () => {
+    const agents = createAgents(
+      runtimeFor({
+        disabled_agents: [],
+        agents: {
+          reviewer: {
+            model: 'openai/gpt-6',
+            prompt: 'You are the custom reviewer agent.',
+          },
+        },
+      }),
+      { hostFlavor: 'v2' },
+    );
+    const reviewer = agents.find((agent) => agent.name === 'reviewer');
+    const permission = (reviewer?.config.permission ?? {}) as Record<
+      string,
+      unknown
+    >;
+    expect(permission.task).toEqual({ '*': 'deny' });
+  });
+
+  test('v1 hosts carry no nested-dispatch entries at all', () => {
+    const agents = createAgents(
+      runtimeFor({
+        disabled_agents: [],
+        agents: {
+          reviewer: {
+            model: 'openai/gpt-6',
+            prompt: 'You are the custom reviewer agent.',
+          },
+        },
+      }),
+    );
+    for (const agent of agents) {
+      const permission = (agent.config.permission ?? {}) as Record<
+        string,
+        unknown
+      >;
+      expect(permission.task).toBeUndefined();
+    }
+  });
+
+  test('the orchestrator is exempt from the nested-dispatch default', () => {
+    const agents = createAgents(runtimeFor({}));
+    const orchestrator = agents.find((agent) => agent.name === 'orchestrator');
+    const permission = (orchestrator?.config.permission ?? {}) as Record<
+      string,
+      unknown
+    >;
+    expect(permission.task).toBeUndefined();
+  });
+});
+
+describe('nested-dispatch default', () => {
+  test('plugin-config permission override without task keeps the role stance', () => {
+    const agents = createAgents(
+      runtimeFor({
+        disabled_agents: [],
+        agents: {
+          oracle: {
+            model: 'provider/model',
+            permission: { read: 'allow' },
+          },
+        },
+      }),
+      { hostFlavor: 'v2' },
+    );
+    const oracle = agents.find((agent) => agent.name === 'oracle');
+    const permission = (oracle?.config.permission ?? {}) as Record<
+      string,
+      unknown
+    >;
+    expect(permission.read).toBe('allow');
+    expect(permission.task).toEqual({ '*': 'deny', observer: 'allow' });
+  });
+
+  test('plugin-config task override wins over the role default', () => {
+    const agents = createAgents(
+      runtimeFor({
+        disabled_agents: [],
+        agents: {
+          oracle: {
+            model: 'provider/model',
+            permission: { task: 'deny' },
+          },
+        },
+      }),
+      { hostFlavor: 'v2' },
+    );
+    const oracle = agents.find((agent) => agent.name === 'oracle');
+    const permission = (oracle?.config.permission ?? {}) as Record<
+      string,
+      unknown
+    >;
+    expect(permission.task).toBe('deny');
   });
 });

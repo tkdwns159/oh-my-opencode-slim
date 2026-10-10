@@ -36,8 +36,14 @@ import { log } from '../../utils/logger';
  *   warn at N calls but stay warn-only (never hard-block) to avoid deadlocking
  *   terminal result retrieval for long-running background tasks.
  * - Task management and lifecycle tools (task, task_cancel, task_message,
- *   task_revive, wait_for_*) remain exempt; task-session-manager owns its
- *   own duplicate-spawn guards (#1056/#1070).
+ *   task_revive) remain exempt; task-session-manager owns its own
+ *   duplicate-spawn guards (#1056/#1070).
+ * - Wait tools (wait_for_user, wait_for_background_tasks) use a dedicated
+ *   per-turn counter keyed by tool name only: their contract is "end the
+ *   turn", so a repeat call within one turn is always degenerate regardless
+ *   of arguments or output. They warn at 2 completed calls and the 3rd call
+ *   is refused (#1139). The counter resets on a new user message, a
+ *   completed turn, or session deletion.
  *
  * Precedent: json-error-recovery (output warning) and task-session-manager
  * (before-hook refusal).
@@ -55,8 +61,6 @@ const LOOP_GUARD_EXEMPT: Record<string, true> = {
   task_cancel: true,
   task_message: true,
   task_revive: true,
-  wait_for_user: true,
-  wait_for_background_tasks: true,
 };
 
 /**
@@ -71,6 +75,28 @@ const LOOP_GUARD_BLOCK_TOOLS: Record<string, true> = {
   glob: true,
 };
 
+/**
+ * Wait tools whose contract is "end this turn now". Repeating them within a
+ * turn is always degenerate: the first result already told the model to stop
+ * calling tools, and because the tool returns instantly, each repeat
+ * re-triggers a full-context inference — a non-compliant model can loop
+ * indefinitely (#1139). Counted by tool name only (arguments and output may
+ * vary); both tools share one per-session stream.
+ */
+const WAIT_TOOLS = new Set(['wait_for_user', 'wait_for_background_tasks']);
+const WAIT_GUARD_WARN_AT = 2;
+const WAIT_GUARD_BLOCK_AT = 2;
+
+export const WAIT_GUARD_MARKER = '[REPEATED WAIT TOOL - END TURN]';
+
+export const WAIT_GUARD_WARNING = `
+${WAIT_GUARD_MARKER}
+
+You have already called a wait tool ${WAIT_GUARD_WARN_AT} times in this turn. Its result instructed you to end the turn — do not call it again.
+
+STOP calling tools. Respond to the user in plain text and end your turn. The next distinct external user message resumes normal continuation.
+`;
+
 const LOOP_GUARD_MARKER = '[REPEATED TOOL CALLS - STOP]';
 
 export const LOOP_GUARD_WARNING = `
@@ -84,8 +110,8 @@ STOP repeating this call. Instead:
 3. If the task is actually done, produce your final answer now instead of calling more tools.
 `;
 
-/** Max sessions tracked before evicting the least-recently-observed session. */
-const MAX_TRACKED_SESSIONS = 512;
+/** Max entries per tracking map before FIFO eviction. */
+export const MAX_TRACKED_SESSIONS = 512;
 
 /** Deterministic fingerprint of tool + args, insensitive to key order. */
 function fingerprint(tool: string, args: unknown): string {
@@ -131,7 +157,8 @@ const TASK_SUPERVISION_TOOLS = new Set(['task_status', 'task_result']);
 function taskIDFromArgs(args: unknown): string | undefined {
   if (!args || typeof args !== 'object' || Array.isArray(args))
     return undefined;
-  const taskID = (args as Record<string, unknown>).task_id;
+  const record = args as Record<string, unknown>;
+  const taskID = record.sessionID ?? record.task_id;
   return typeof taskID === 'string' && taskID.trim() !== ''
     ? taskID.trim()
     : undefined;
@@ -139,7 +166,9 @@ function taskIDFromArgs(args: unknown): string | undefined {
 
 function taskIDFromOutput(output: unknown): string | undefined {
   if (typeof output !== 'string') return undefined;
-  const match = output.match(/(?:task_id:\s*|Task\s+[^\n(]*\()([^\s)]+)/i);
+  const match = output.match(
+    /(?:(?:task_id|sessionID):\s*|Task\s+[^\n(]*\()([^\s)]+)/i,
+  );
   return match?.[1];
 }
 
@@ -175,6 +204,8 @@ export function createToolLoopGuardHook(): ToolLoopGuardHook {
   const callKeys = new Map<string, CallState>();
   /** Polling state is shared by task_status/task_result for each task. */
   const taskSupervision = new Map<string, Map<string, TaskSupervisionState>>();
+  /** Completed wait-tool calls since the last reset, per session (#1139). */
+  const waitRuns = new Map<string, number>();
   /** Last durable user-message identity observed for each session. */
   const userMessageIdentities = new Map<string, string>();
 
@@ -182,12 +213,12 @@ export function createToolLoopGuardHook(): ToolLoopGuardHook {
     taskSupervision.delete(sessionID);
   }
 
-  /** Prune the session map to MAX_TRACKED_SESSIONS (FIFO by insertion). */
+  /** FIFO-cap tracked maps; a throwing tool never runs `after` (callKeys). */
   function keepSessionsBounded(): void {
-    while (sessions.size > MAX_TRACKED_SESSIONS) {
-      const oldest = sessions.keys().next().value as string | undefined;
-      if (oldest === undefined) break;
-      sessions.delete(oldest);
+    for (const map of [sessions, waitRuns, callKeys]) {
+      while (map.size > MAX_TRACKED_SESSIONS) {
+        map.delete(map.keys().next().value as string);
+      }
     }
   }
 
@@ -198,7 +229,33 @@ export function createToolLoopGuardHook(): ToolLoopGuardHook {
     ): Promise<void> => {
       const sessionID = input.sessionID;
       if (!sessionID) return;
+      keepSessionsBounded();
       const tool = input.tool.toLowerCase();
+
+      // Wait tools: refuse once the per-turn wait counter confirms a loop.
+      // A wait tool's result already says "end this turn", so a repeat is
+      // never legitimate progress (#1139).
+      if (WAIT_TOOLS.has(tool)) {
+        resetTaskSupervision(sessionID);
+        const runs = waitRuns.get(sessionID) ?? 0;
+        if (runs >= WAIT_GUARD_BLOCK_AT) {
+          log('[tool-loop-guard] blocked repeated wait tool call', {
+            sessionID,
+            tool,
+            runs,
+          });
+          throw new Error(
+            `Refusing to execute "${tool}": a wait tool has already completed ${runs} times this turn and instructed you to end the turn. Do not call any more tools. Respond to the user in plain text and end your turn.`,
+          );
+        }
+        // Record the call only when it will actually run. A refused call
+        // never reaches the after hook, so its entry would leak (#1140).
+        if (input.callID) {
+          callKeys.set(input.callID, { sessionID, key: `wait:${tool}` });
+        }
+        return;
+      }
+
       if (LOOP_GUARD_EXEMPT[tool]) {
         resetTaskSupervision(sessionID);
         return;
@@ -251,6 +308,32 @@ export function createToolLoopGuardHook(): ToolLoopGuardHook {
       if (!sessionID) return;
       const tool = input.tool.toLowerCase();
       if (LOOP_GUARD_EXEMPT[tool]) return;
+
+      // Wait tools: count completed calls by tool name, warn from the 2nd
+      // on. The before hook refuses the call once the counter reaches the
+      // block threshold (#1139).
+      if (WAIT_TOOLS.has(tool)) {
+        const call = input.callID ? callKeys.get(input.callID) : undefined;
+        if (input.callID) callKeys.delete(input.callID);
+        // An after hook without a matching before hook is stale.
+        if (!input.callID || !call) return;
+        const runs = (waitRuns.get(sessionID) ?? 0) + 1;
+        waitRuns.set(sessionID, runs);
+        keepSessionsBounded();
+        if (
+          runs >= WAIT_GUARD_WARN_AT &&
+          typeof output.output === 'string' &&
+          !output.output.includes(WAIT_GUARD_MARKER)
+        ) {
+          log('[tool-loop-guard] warned repeated wait tool call', {
+            sessionID,
+            tool,
+            runs,
+          });
+          output.output += `\n${WAIT_GUARD_WARNING}`;
+        }
+        return;
+      }
 
       const call = input.callID ? callKeys.get(input.callID) : undefined;
       if (input.callID) callKeys.delete(input.callID);
@@ -330,17 +413,20 @@ export function createToolLoopGuardHook(): ToolLoopGuardHook {
       if (userMessageIdentities.get(sessionID) === messageID) return;
       userMessageIdentities.set(sessionID, messageID);
       resetTaskSupervision(sessionID);
+      waitRuns.delete(sessionID);
     },
 
     /** Clear task supervision state at a completed parent turn. */
     resetTurn(sessionID: string): void {
       resetTaskSupervision(sessionID);
+      waitRuns.delete(sessionID);
     },
 
     /** Clear all state for a finished/deleted session. */
     resetSession(sessionID: string): void {
       sessions.delete(sessionID);
       resetTaskSupervision(sessionID);
+      waitRuns.delete(sessionID);
       userMessageIdentities.delete(sessionID);
       for (const [callID, call] of callKeys) {
         if (call.sessionID === sessionID) callKeys.delete(callID);
@@ -352,6 +438,7 @@ export function createToolLoopGuardHook(): ToolLoopGuardHook {
       sessions.clear();
       callKeys.clear();
       taskSupervision.clear();
+      waitRuns.clear();
       userMessageIdentities.clear();
     },
   };

@@ -14,8 +14,8 @@ A glossary of the terms used in this project's domain. Definitions describe what
 - **Fixer** — Subagent for bounded implementation and execution.
 - **Observer** — Subagent for visual/media analysis (images, PDFs, diagrams). Disabled by default.
 - **Council** — A multi-LLM agent that runs several councillors and synthesizes their views.
-- **Councillor** — A read-only LLM advisor dispatched as a subagent by the orchestrator. Each councillor is registered as `councillor-<name>` from the council preset. Not hidden; visible in the TUI as panes.
-- **Agent mode** — SDK classification of an agent: `primary` (orchestrator), `subagent` (specialist), or `all` (council, both user-facing and delegatable).
+- **Councillor** — A read-only LLM advisor dispatched as a subagent by the orchestrator. Each councillor is registered as `councillor-<name>` from the council preset. Hidden from the @-mention menu; visible as panes when dispatched.
+- **Agent mode** — SDK classification of an agent: `primary` (orchestrator) or `subagent` (specialist, including council — the synthesizer is dispatched by the orchestrator, never switched to as a primary).
 - **Protected agent** — An agent that cannot be disabled (orchestrator).
 - **Custom agent** — A user-defined agent supplied via config, distinct from the built-ins.
 - **ACP agent** — An external agent defined via the Agent Communication Protocol, run through `acp_run`.
@@ -29,12 +29,12 @@ A glossary of the terms used in this project's domain. Definitions describe what
 
 ## Multiplexer & Sessions
 
-- **Multiplexer** — A terminal backend (tmux, zellij, herdr, or kitty) that hosts child agent panes. Set via \`multiplexer.type\`, which also accepts \`auto\` (auto-detect) and \`none\` (disabled).
-- **Multiplexer type** — The selected backend: `auto`, `tmux`, `zellij`, `herdr`, `kitty`, or `none`.
+- **Multiplexer** — A terminal backend (tmux, zellij, herdr, kitty, or cmux) that hosts child agent panes. Set via \`multiplexer.type\`, which also accepts \`auto\` (auto-detect) and \`none\` (disabled).
+- **Multiplexer type** — The selected backend: `auto`, `tmux`, `zellij`, `herdr`, `kitty`, `cmux`, or `none`.
 - **Pane** — A terminal region spawned by the multiplexer to run a child agent session.
-- **Child session** — A background agent session hosted in a multiplexer pane and tracked by the session manager.
-- **Session manager** — Tracks child sessions, spawns and closes multiplexer panes, and reacts to session lifecycle events. Note: `TmuxSessionManager` is a deprecated alias — use `MultiplexerSessionManager`.
-- **Close reason** — Why a pane is closed: `idle` or `deleted`.
+- **Child session** — A background agent session hosted in a multiplexer pane and tracked by the background job board.
+- **Client pane lifecycle** — The TUI client's in-process pane tracking: admits child sessions of the displayed parent, spawns and closes multiplexer panes anchored to the client's own pane, and reacts to session lifecycle events. There is no server-side or cross-process pane state.
+- **Close reason** — Why a pane is closed: `idle`, `deleted`, or `backfill-gone`.
 
 ## Background Jobs
 
@@ -51,7 +51,7 @@ A glossary of the terms used in this project's domain. Definitions describe what
 
 ## Hooks
 
-- **Hook** — A plugin extension point that reacts to OpenCode lifecycle events (e.g., apply-patch, filter-available-skills, loop-command, session-lifecycle).
+- **Hook** — A plugin extension point that reacts to OpenCode lifecycle events (e.g., apply-patch, loop-command, session-lifecycle).
 
 ## Loop
 
@@ -81,6 +81,7 @@ A glossary of the terms used in this project's domain. Definitions describe what
 - **Variant** — An optional model qualifier (e.g., a preview build) used in fallback resolution.
 - **Fallback / failover** — The mechanism that switches models when a call is rate-limited or returns empty.
 - **Disabled agents** — Agents turned off via config; `observer` is disabled by default.
+- **Disabled hooks / commands** — Config keys that disable hooks or slash commands entirely: `disabled_hooks` (`phase-reminder`, `foreground-fallback`, `deepwork-guard`, `chat-headers`, `cache-monitor`, `json-error-recovery`, `tool-loop-guard`, `search-path-guard`, `absolute-path-rescue`, `apply-patch`, `council-inject`) and `disabled_commands` (`interview`, `deepwork`, `reflect`, `loop`).
 
 ## Flagged
 

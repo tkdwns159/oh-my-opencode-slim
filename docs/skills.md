@@ -5,10 +5,11 @@ Unlike MCPs (which are running servers), skills are **prompt-based instructions*
 injected into an agent's system prompt to guide decisions, workflows, and, when
 relevant, tool use.
 
-Bundled skills are installed by the `oh-my-opencode-slim` installer and safely
-reconciled on plugin startup/auto-update. Local customizations are preserved;
-new bundled versions for customized skills are staged under
-`~/.config/opencode/.oh-my-opencode-slim/skill-updates/` for manual review.
+Bundled skills are registered in-process by the plugin at load (never copied to
+disk); plugin updates apply on the next OpenCode restart. Skills listed in
+`disabled_skills` are not registered. To override a bundled skill, create a
+same-named directory under `~/.config/opencode/skills/` — directory skills take
+precedence over the bundled registration.
 
 ---
 
@@ -104,7 +105,7 @@ See **[Clonedeps](clonedeps.md)** for the full workflow and file layout.
 
 **Heavy/complex coding sessions and large modifications workflow.**
 
-`deepwork` is an orchestrator-only workflow skill for managing deep architectural work, multi-phase implementations, and complex refactoring. It provides a structured approach with risk-based review gates while maintaining flexibility in planning.
+`deepwork` is an orchestrator workflow for deep architectural work, multi-phase implementations, and complex refactoring, with risk-based review gates and flexible planning. It is surfaced two ways: as a resident bundled skill (so the model can auto-activate it when a task clearly warrants it) and via the self-contained `/deepwork <task>` command, which injects the full bundled `SKILL.md` instructions directly. The command does not depend on skill registration — users who prefer minimal resident context can list `deepwork` in `disabled_skills` without losing `/deepwork`. To also remove the command, list `deepwork` in `disabled_commands`.
 
 Start it directly with:
 
@@ -118,25 +119,28 @@ Start it directly with:
    `.slim/deepwork/` in `.gitignore` and `!.slim/deepwork/` plus
    `!.slim/deepwork/**` in `.ignore`. This keeps state git-local while making it
    readable to OpenCode.
-2. Orchestrator creates a session artifact at `.slim/deepwork/<task>.md`
+2. Orchestrator creates a router head at `.slim/deepwork/<session-id>.md` and a
+   task directory `.slim/deepwork/<task-slug>/` holding the task's progress file
+   and topic files
 3. Draft a phased implementation plan with a small number of coherent phases
    based on dependencies and natural delivery boundaries. Do not split work
    merely to make an Oracle review smaller.
 4. Before execution, show a compact overview of phase order, specialist
    ownership/scope, the Oracle review total, the review after each phase, and a
    short reason for each gate.
-5. Execute phase by phase: validate, update session state, then get an Oracle
-   review before advancing.
+5. Execute phase by phase: validate, update the task progress file, then get an
+   Oracle review before advancing.
 6. Batch material findings into one bounded remediation pass with focused
    validation. Re-review only when needed to assess a changed decision/risk or
    an otherwise unverifiable concern.
 
 **Key features:**
-- Persistent session state in markdown files
+- Bounded state: a ≤12-line router head per session, an ~80-line progress file
+  per task, one-line fold-on-close entries
 - Predictable Oracle reviews after each planned phase, declared before execution
 - V2 scheduler integration (dispatch specialists, wait for hook-driven completion, reconcile)
-- OpenCode todo lists for progress tracking
-- Flexible structure - orchestrator adapts format to task needs
+- Fixed head, flexible body — the orchestrator shapes everything below the
+  progress-file head
 
 **When to use:** Large-scale refactoring, multi-file architectural changes, complex feature development spanning modules.
 
@@ -201,6 +205,9 @@ reflect on my recent workflows
 find repeated work worth turning into reusable instructions
 suggest skills or agent config improvements from what I keep doing
 ```
+
+Listing `reflect` in `disabled_skills` also disables the `/reflect` command;
+the command is not registered when the skill is disabled.
 
 Reflect is intentionally conservative. If no repeated workflow is strong enough,
 it should recommend creating nothing instead of manufacturing new assets.
@@ -309,3 +316,30 @@ Control which skills each agent can use in `~/.config/opencode/oh-my-opencode-sl
   }
 }
 ```
+
+### Adding or removing skills on top of an inherited list
+
+`skills` is replaced wholesale when multiple config layers (user, project, preset) define it. To adjust an inherited list instead, use the `skills_add` / `skills_remove` directives. They are folded into the effective `skills` array during config resolution and stripped afterwards, so agents and hooks only ever see plain `skills`:
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `skills_add` | string[] | Skill names appended to the effective list (after `skills`) |
+| `skills_remove` | string[] | Skill names removed from the effective list; removal wins over addition |
+
+```json
+{
+  "agents": {
+    "oracle": {
+      "skills_add": ["nexus-backend"],
+      "skills_remove": ["deepwork"]
+    }
+  }
+}
+```
+
+**Rules:**
+- Duplicates are removed (first occurrence wins) before removals are applied
+- If the result contains `"*"`, each removed name is appended as `"!<name>"` so the exclusion beats the wildcard grant
+- On an agent without a `skills` list, directives resolve against that agent's default grants (orchestrator: all skills), so `skills_add` keeps the defaults and appends, and `skills_remove` prunes from them
+- `skills_add` never overrides an inherited exclusion: adding a name that the effective list already excludes (as `"!<name>"`) is a no-op. To re-allow it, lift the exclusion with a `skills_remove` entry of the form `"!<name>"`
+- A removal entry of the form `"!<name>"` removes the exclusion token itself (it lifts an existing exclusion); the `"*"` token is never expanded

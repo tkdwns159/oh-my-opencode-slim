@@ -7,16 +7,22 @@ const COUNCILLOR_AGENT_PREFIX = 'councillor-';
 /**
  * Build dynamic councillor agents from council config presets.
  * Each councillor gets its own agent (name + model) so the orchestrator
- * can task() them with native panes at depth 1 using per-councillor models.
+ * can dispatch them with native panes (via `task()` on v1, `subagent()` on v2)
+ * at depth 1 using per-councillor models.
  * Agent names are prefixed with `councillor-` because raw councillor names
  * (e.g. "alpha") can collide with OpenCode-reserved agent type names.
  */
 export function buildCouncillorAgents(
   runtime: RuntimeConfig,
   disabled: Set<string>,
+  observerDispatchEnabled = false,
 ): AgentDefinition[] {
   const council = runtime.council;
   if (!council) return [];
+  // Explicitly disabling the council agent disables the whole chain: the
+  // injected procedure dispatches seats and then delegates synthesis to
+  // the council agent, so seats without it would dangle.
+  if (disabled.has('council')) return [];
 
   const presetName = council.default_preset ?? 'default';
   const preset = council.presets[presetName];
@@ -33,6 +39,7 @@ export function buildCouncillorAgents(
       undefined,
       cfg.prompt,
       cfg.variant,
+      observerDispatchEnabled,
     );
 
     // If a fallback chain is configured, attach _modelArray for runtime

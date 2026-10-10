@@ -4,17 +4,20 @@ import { getClient } from './opencode-client';
 
 export type RuntimeSessionStatus = 'busy' | 'retry' | 'idle';
 export const DEFAULT_RUNTIME_SESSION_STATUS_TIMEOUT_MS = 5_000;
+const openStatusReads = new WeakMap<object, Promise<void>>();
 
 export interface RuntimeSessionStatusSnapshot {
   statuses: ReadonlyMap<string, RuntimeSessionStatus>;
   malformedSessionIDs: ReadonlySet<string>;
   error?: string;
+  /** Slot availability only: never exposes the open read's evidence. */
+  retryAfter?: Promise<void>;
 }
 
 /**
  * Reads OpenCode's single live session-status map. An absent session in a
- * valid response is unknown: the endpoint only describes currently active
- * runners and does not prove that a background task has terminated.
+ * valid response is quiescent, not terminal. The gate still requires result
+ * attribution or stable valid absence before publishing a terminal state.
  */
 export async function getRuntimeSessionStatusSnapshot(
   input: PluginInput,
@@ -25,13 +28,43 @@ export async function getRuntimeSessionStatusSnapshot(
       typeof input.client?.session?.status === 'function'
         ? input.client
         : getClient(input);
+    if (typeof client?.session?.status !== 'function') {
+      return {
+        statuses: new Map(),
+        malformedSessionIDs: new Set(),
+        error: 'session-status capability unavailable on this host',
+      };
+    }
+    const openRead = openStatusReads.get(client.session);
+    if (openRead)
+      return {
+        statuses: new Map(),
+        malformedSessionIDs: new Set(),
+        error: 'Previous session-status read is still open',
+        retryAfter: openRead,
+      };
+    const controller = new AbortController();
+    const request = client.session.status({
+      query: { directory: input.directory },
+      signal: controller.signal,
+    });
+    const release = () => {
+      if (openStatusReads.get(client.session) === settled)
+        openStatusReads.delete(client.session);
+    };
+    const settled = request.then(release, release);
+    openStatusReads.set(client.session, settled);
     const response = await withTimeout(
-      client.session.status({
-        query: { directory: input.directory },
-      }),
+      request,
       options.timeoutMs ?? DEFAULT_RUNTIME_SESSION_STATUS_TIMEOUT_MS,
-    );
-    if (!isRecord(response.data)) {
+    ).catch((error) => {
+      controller.abort();
+      throw error;
+    });
+    if (
+      (response.error !== undefined && response.error !== null) ||
+      !isRecord(response.data)
+    ) {
       return {
         statuses: new Map(),
         malformedSessionIDs: new Set(),
@@ -71,6 +104,25 @@ export async function getRuntimeSessionStatusSnapshot(
       error: error instanceof Error ? error.message : String(error),
     };
   }
+}
+
+export type LiveSession =
+  | { kind: RuntimeSessionStatus | 'absent' }
+  | { kind: 'unknown'; reason: string };
+
+/** One fresh read, reduced to what a single session's decision needs. */
+export async function readLiveSession(
+  input: PluginInput,
+  sessionID: string,
+  options: { timeoutMs?: number } = {},
+): Promise<LiveSession> {
+  const snapshot = await getRuntimeSessionStatusSnapshot(input, options);
+  if (
+    snapshot.error !== undefined ||
+    snapshot.malformedSessionIDs.has(sessionID)
+  )
+    return { kind: 'unknown', reason: snapshot.error ?? 'malformed entry' };
+  return { kind: snapshot.statuses.get(sessionID) ?? 'absent' };
 }
 
 export function runtimeSessionStatus(

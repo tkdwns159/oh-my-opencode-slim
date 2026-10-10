@@ -15,7 +15,12 @@
   </p>
 
   <p>
-    <a href="README.md">English</a> | <b>简体中文</b> | <a href="README.ja-JP.md">日本語</a> | <a href="README.ko-KR.md">한국어</a>
+    <a href="https://svgdiagram.ai"><img src="img/svgdiagram-logo.svg" alt="svgdiagram.ai" width="40" height="28" align="absmiddle"></a>&nbsp;
+    <a href="https://svgdiagram.ai"><b>svgdiagram.ai</b></a> <sub>· 将你的笔记变成清晰、可编辑的 SVG 图表</sub>
+  </p>
+
+  <p>
+    <a href="README.md">English</a> | <b>简体中文</b> | <a href="README.ja-JP.md">日本語</a> | <a href="README.ko-KR.md">한국어</a> | <a href="README.fa-IR.md">فارسی</a>
   </p>
 
   <p><sub>✦ ✦ ✦</sub></p>
@@ -40,7 +45,7 @@ oh-my-opencode-slim 是一个用于 OpenCode 的智能体编排插件。它内�
 - **[代码智能工具](docs/tools.md)** —— LSP 工具、支持 25 种语言的 AST 感知搜索，以及用于文档和 GitHub 代码搜索的内置 MCP。
 - **[完全可定制](docs/configuration.md)** —— 自定义智能体、提示词覆盖、按智能体控制的 Skill/MCP 权限，以及[项目本地定制](docs/project-local-customization.md)。
 
-### OpenAI GPT-5.6
+### OpenAI GPT-6
 
 <p align="center">
   <img src="img/openai-gpt-5-6-pantheon.jpeg" alt="OpenAI GPT-5.6 众神殿：Terra、Sol 和 Luna" width="100%">
@@ -146,12 +151,12 @@ bun run build
   "preset": "openai",
   "presets": {
     "openai": {
-      "orchestrator": { "model": "openai/gpt-5.6-terra", "variant": "high", "skills": ["*"], "mcps": ["*", "!context7"] },
-      "oracle": { "model": "openai/gpt-5.6-sol", "variant": "high", "skills": ["simplify"], "mcps": [] },
-      "librarian": { "model": "openai/gpt-5.6-luna", "variant": "low", "skills": [], "mcps": ["context7", "gh_grep"] },
-      "explorer": { "model": "openai/gpt-5.6-luna", "variant": "low", "skills": [], "mcps": [] },
-      "designer": { "model": "openai/gpt-5.6-luna", "variant": "medium", "skills": [], "mcps": [] },
-      "fixer": { "model": "openai/gpt-5.6-luna", "variant": "high", "skills": [], "mcps": [] }
+      "orchestrator": { "model": "openai/gpt-6-sol", "variant": "high", "skills": ["*"], "mcps": ["*", "!context7"] },
+      "oracle": { "model": "openai/gpt-6-astra", "variant": "high", "skills": ["simplify"], "mcps": [] },
+      "librarian": { "model": "openai/gpt-6-luna", "variant": "low", "skills": [], "mcps": ["context7", "gh_grep"] },
+      "explorer": { "model": "openai/gpt-6-luna", "variant": "low", "skills": [], "mcps": [] },
+      "designer": { "model": "openai/gpt-6-luna", "variant": "medium", "skills": [], "mcps": [] },
+      "fixer": { "model": "openai/gpt-6-luna", "variant": "high", "skills": [], "mcps": [] }
     },
     "opencode-go": {
       "orchestrator": { "model": "opencode-go/minimax-m3", "variant": "thinking" },
@@ -172,7 +177,6 @@ bun run build
 - **[OpenCode Go 预设](docs/opencode-go-preset.md)** —— 智能体使用 OpenCode Go 模型；由于其 Orchestrator 模型不支持多模态，因此启用 Observer 进行视觉分析。
 - **[作者的预设](docs/authors-preset.md)** —— 作者日常使用的精确配置，包含第三方 Skills。
 - **[$30 预设](docs/thirty-dollars-preset.md)** —— 围绕 Codex Plus 和 GitHub Copilot Pro 构建的混合服务商方案，每月约 30 美元。
-- **[OpenCode Zen 免费预设](docs/opencode-zen-free-preset.md)** —— 所有智能体均使用 opencode 免费模型；无需使用费用。
 
 ### 针对其他服务商
 
@@ -229,12 +233,12 @@ ping all agents
   </tr>
   <tr>
     <td colspan="2">
-      <b>默认模型：</b> <code>openai/gpt-5.6-terra (medium)</code>
+      <b>默认模型：</b> <code>openai/gpt-6-sol (medium)</code>
     </td>
   </tr>
   <tr>
     <td colspan="2">
-      <b>推荐模型：</b> <code>openai/gpt-5.6-terra (medium)</code> <code>anthropic/claude-fable-5</code> <code>anthropic/claude-opus-4-8</code>
+      <b>推荐模型：</b> <code>openai/gpt-6-sol (medium)</code> <code>anthropic/claude-fable-5</code> <code>anthropic/claude-opus-4-8</code>
     </td>
   </tr>
   <tr>
@@ -270,7 +274,7 @@ ping all agents
   </tr>
   <tr>
     <td colspan="2">
-      <b>默认模型：</b> <code>openai/gpt-5.6-luna</code>
+      <b>默认模型：</b> <code>openai/gpt-6-luna</code>
     </td>
   </tr>
   <tr>
@@ -311,12 +315,12 @@ ping all agents
   </tr>
   <tr>
     <td colspan="2">
-      <b>默认模型：</b> <code>openai/gpt-5.6-sol (high)</code>
+      <b>默认模型：</b> <code>openai/gpt-6-astra (high)</code>
     </td>
   </tr>
   <tr>
     <td colspan="2">
-      <b>推荐模型：</b> <code>openai/gpt-5.6-sol (xhigh)</code> <code>anthropic/claude-fable-5</code> <code>anthropic/claude-opus-4-8 (xhigh)</code>
+      <b>推荐模型：</b> <code>openai/gpt-6-astra (xhigh)</code> <code>anthropic/claude-fable-5</code> <code>anthropic/claude-opus-4-8 (xhigh)</code>
     </td>
   </tr>
   <tr>
@@ -331,7 +335,7 @@ ping all agents
 ### 04. Council：思维的合唱团
 
 > [!NOTE]
-> **为什么 Orchestrator 不经常自动调用 Council？** 这是刻意设计的。Council 会同时运行多个模型，由于这通常是系统中成本最高的路径，因此自动委派逻辑非常严格。在实际使用中，Council 旨在供您手动调用，例如：<code>@council 比较这两种架构</code>。
+> **为什么 Orchestrator 不经常自动调用 Council？** 这是刻意设计的。Council 会同时运行多个模型，由于这通常是系统中成本最高的路径，因此自动委派逻辑非常严格。在实际使用中，在消息中提到 `council`、`@council`、`consensus` 或 `共识` 等触发词会为该会话注入一次 Council Mode 程序（在首个触发词处注入，后续触发词不再重复注入），Orchestrator 随之并行派发每个议员席位，例如：<code>run a council on these two architectures</code>。完整程序从不静态携带：从不请求 council 的会话为此支付零 token，且注入可通过 <code>disabled_hooks: ["council-inject"]</code> 完全关闭。
 
 <table>
   <tr>
@@ -401,7 +405,7 @@ ping all agents
   </tr>
   <tr>
     <td colspan="2">
-      <b>默认模型：</b> <code>openai/gpt-5.6-luna</code>
+      <b>默认模型：</b> <code>openai/gpt-6-luna</code>
     </td>
   </tr>
   <tr>
@@ -442,7 +446,7 @@ ping all agents
   </tr>
   <tr>
     <td colspan="2">
-      <b>默认模型：</b> <code>openai/gpt-5.6-luna</code>
+      <b>默认模型：</b> <code>openai/gpt-6-luna</code>
     </td>
   </tr>
   <tr>
@@ -483,12 +487,12 @@ ping all agents
   </tr>
   <tr>
     <td colspan="2">
-      <b>默认模型：</b> <code>openai/gpt-5.6-luna (medium)</code>
+      <b>默认模型：</b> <code>openai/gpt-6-luna (medium)</code>
     </td>
   </tr>
   <tr>
     <td colspan="2">
-      <b>推荐模型：</b> <code>openai/gpt-5.6-luna (medium)</code> <code>anthropic/claude-sonnet-4-6</code>
+      <b>推荐模型：</b> <code>openai/gpt-6-luna (medium)</code> <code>anthropic/claude-sonnet-4-6</code>
     </td>
   </tr>
   <tr>
@@ -505,7 +509,10 @@ ping all agents
 ### Observer：静默的见证者
 
 > [!NOTE]
-> **为什么要独立出一个智能体？** 如果您的 Orchestrator 模型不是多模态模型，可以启用 Observer 来处理图像、屏幕截图和其他视觉文件。Observer 默认是禁用的，它在无需您更改核心推理模型的情况下，为 Orchestrator 赋予了专用的多模态读取能力。只需在您的配置中设置 `disabled_agents: []` 并指定一个 `observer` 模型即可。自带的 `opencode-go` 安装预设会自动执行此操作，因为其 GLM Orchestrator 不是多模态模型。省略 `image_routing` 会保留现有的条件式 Observer 行为。仅在启用 Observer 时设置 `image_routing: "auto"`，或设为 `"direct"` 以始终将图片附件直接传给 Orchestrator。
+> **为什么要独立出一个智能体？** 如果您的 Orchestrator 模型不是多模态模型，可以启用 Observer 来处理图像、屏幕截图和其他视觉文件。Observer 默认是禁用的，它在无需您更改核心推理模型的情况下，为 Orchestrator 赋予了专用的多模态读取能力。只需在您的配置中设置 `disabled_agents: []` 并指定一个 `observer` 模型即可。自带的 `opencode-go` 安装预设会自动执行此操作，因为其 GLM Orchestrator 不是多模态模型。省略 `image_routing` 会保留现有的条件式 Observer 行为。`image_routing: "auto"` 具备能力感知：接受图片输入的模型将附件内联保留（原生视觉直读）；非视觉链路则将附件存入 `.opencode/images/<session>/` 并按路径委派 Observer。`"direct"` 则始终将图片附件内联直达。
+
+> [!TIP]
+> **子代理读取图片。** 顾问型子代理（explorer、librarian、oracle、designer、councillor）可自行调度 `@observer` 读取磁盘上的图片文件。在 OpenCode v2 宿主上这需要放开一层嵌套，而宿主默认是关闭的——请在 opencode 配置中设置 `"experimental": { "subagent_depth": 2 }` 以启用。fixer、observer 自身与 council 合成代理按设计不可派生。
 
 <table>
   <tr>
@@ -519,7 +526,7 @@ ping all agents
 
 - 图像、屏幕截图、图表 → `read` 工具（原生图像支持）
 - PDF 和二进制文档 → `read` 工具（文本 + 结构提取）
-- **默认禁用** -- 通过设置 `"disabled_agents": []` 和配置具有视觉能力的模型来启用；若使用 `--preset=opencode-go` 预设安装，将自动使用 `opencode-go/mimo-v2.5` 启用它。启用时，图片附件默认会路由至 Observer；设置 `"image_routing": "direct"` 可将其保留给 Orchestrator。
+- **默认禁用** -- 通过设置 `"disabled_agents": []` 和配置具有视觉能力的模型来启用；若使用 `--preset=opencode-go` 预设安装，将自动使用 `opencode-go/mimo-v2.5` 启用它。启用时，`"auto"` 按模型能力分流：视觉模型内联直读，非视觉链路存盘并路由至 Observer；设置 `"image_routing": "direct"` 可始终保留给 Orchestrator。
 
     </td>
   </tr>
@@ -530,7 +537,7 @@ ping all agents
   </tr>
   <tr>
     <td colspan="2">
-      <b>默认模型：</b> <code>openai/gpt-5.6-luna</code> - <i>需配置具有视觉能力的模型以启用</i>
+      <b>默认模型：</b> <code>openai/gpt-6-luna</code> - <i>需配置具有视觉能力的模型以启用</i>
     </td>
   </tr>
   <tr>

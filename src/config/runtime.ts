@@ -30,16 +30,24 @@ import {
   SUBAGENT_NAMES,
 } from './constants';
 import type { CouncilConfig } from './council-schema';
-import { deepMerge } from './loader';
-import type {
-  AcpAgentsConfig,
-  AgentOverrideConfig,
-  BackgroundJobsConfig,
-  CompanionConfig,
-  FailoverConfig,
-  MultiplexerConfig,
-  PluginConfig,
-  WebfetchConfig,
+import { resolveEffectiveAgentOverrides } from './effective-agent-overrides';
+import {
+  deepMerge,
+  mergeAgentOverrides,
+  PresetResolutionError,
+  resolvePreset,
+} from './loader';
+import { discoverProjectLocalSkillNames } from './project-skills';
+import {
+  type AcpAgentsConfig,
+  type AgentOverrideConfig,
+  type BackgroundJobsConfig,
+  type CompanionConfig,
+  type FailoverConfig,
+  type MultiplexerConfig,
+  MultiplexerConfigStrictSchema,
+  type ResolvedPluginConfig,
+  type WebfetchConfig,
 } from './schema';
 import { getCustomAgentNames } from './utils';
 
@@ -65,12 +73,8 @@ export interface HostConfigSnapshot {
 /** Per-directory registry backing the singleton instances. */
 const registry = new Map<string, RuntimeConfig>();
 
-const DEFAULT_MULTIPLEXER: MultiplexerConfig = {
-  type: 'none',
-  layout: 'main-vertical',
-  main_pane_size: 60,
-  zellij_pane_mode: 'agent-tab',
-};
+const DEFAULT_MULTIPLEXER: MultiplexerConfig =
+  MultiplexerConfigStrictSchema.parse({});
 
 const DEFAULT_BACKGROUND_JOBS: BackgroundJobsConfig = {
   strategy: 'latest',
@@ -79,20 +83,35 @@ const DEFAULT_BACKGROUND_JOBS: BackgroundJobsConfig = {
   readContextMinLines: DEFAULT_READ_CONTEXT_MIN_LINES,
   readContextMaxFiles: DEFAULT_READ_CONTEXT_MAX_FILES,
   maxRetainedSnapshots: DEFAULT_MAX_RETAINED_SNAPSHOTS,
-  orchestratorWake: { enabled: true, intervalMs: 300_000 },
+  orchestratorWake: {
+    enabled: true,
+    intervalMs: 300_000,
+    mode: 'auto',
+    periodicWakeEnabled: true,
+    wakeOnTerminalPublication: true,
+    publicationWakeMinIntervalMs: 30_000,
+  },
   wallClockTimeoutMs: 0,
   abortGraceMs: 10_000,
+  stopConfirmationMs: 5_000,
   concurrency: {
     defaultConcurrency: 0,
     providerConcurrency: {},
     modelConcurrency: {},
   },
+  sameProviderPolicy: {},
   waitForUserGuard: true,
+  childInputWake: true,
+  boardInjection: true,
+  pruneEvictedSessions: false,
 };
 
 const DEFAULT_FALLBACK: FailoverConfig = {
   enabled: true,
   maxRetries: 3,
+  initialRetryDelayMs: 0,
+  retryDelayMs: 500,
+  continuationPolicy: 'retry-primary',
 };
 
 /** First model from an override's model field (string or array). */
@@ -108,44 +127,6 @@ function primaryModelFromOverride(
     return typeof first === 'string' ? first : first?.id;
   }
   return undefined;
-}
-
-/**
- * Merge agent layers while allowing an explicit inheritance policy to clear a
- * model supplied by a lower-precedence layer. A missing `model` normally
- * means "keep the lower layer", but `inheritModelFrom` is an intentional
- * request to use another source instead.
- */
-function mergeAgentOverrides(
-  base: Record<string, AgentOverrideConfig>,
-  override: Record<string, AgentOverrideConfig>,
-): Record<string, AgentOverrideConfig> {
-  const merged = deepMerge(base, override) ?? base;
-  for (const [name, agentOverride] of Object.entries(override)) {
-    if (
-      agentOverride.model !== undefined ||
-      agentOverride.inheritModelFrom === undefined
-    ) {
-      continue;
-    }
-    const resolvedName = AGENT_ALIASES[name] ?? name;
-    // A canonical key in the same layer remains authoritative over its
-    // legacy alias. Otherwise, apply the alias directive to the canonical
-    // lower-layer entry so getOverrideFromAgents sees the effective policy.
-    if (resolvedName !== name && Object.hasOwn(override, resolvedName)) {
-      continue;
-    }
-    const entry = merged[resolvedName] ?? merged[name];
-    if (entry) {
-      const updatedEntry = { ...entry };
-      delete updatedEntry.model;
-      if (resolvedName !== name) {
-        updatedEntry.inheritModelFrom = agentOverride.inheritModelFrom;
-      }
-      merged[resolvedName] = updatedEntry;
-    }
-  }
-  return merged;
 }
 
 /** Recursive clone of plain JSON data (drops prototypes, no functions). */
@@ -186,22 +167,41 @@ export class RuntimeConfig {
   /** Cache-safety marker: never expose volatile text for prompt assembly. */
   readonly isCacheSafe = true as const;
 
-  private constructor() {}
+  private constructor(
+    private readonly directory: string,
+    private hostFlavor?: string,
+  ) {}
 
   /**
    * Seed (or re-seed) the plugin file layer for a directory. Re-seeding
    * preserves runtime state (preset switch, model switches) so plugin reloads
    * keep behavior stable, matching the previous module-level singleton.
    */
-  static init(directory: string, pluginConfig: PluginConfig): RuntimeConfig {
+  static init(
+    directory: string,
+    pluginConfig: ResolvedPluginConfig,
+    hostFlavor?: string,
+  ): RuntimeConfig {
     const existing = registry.get(directory);
     if (existing) {
+      existing.hostFlavor = hostFlavor;
       existing.seedPlugin(pluginConfig);
       return existing;
     }
-    const instance = new RuntimeConfig();
+    const instance = new RuntimeConfig(directory, hostFlavor);
     instance.seedPlugin(pluginConfig);
     registry.set(directory, instance);
+    return instance;
+  }
+
+  /** Create an isolated runtime snapshot for read-only status projections. */
+  static createDetached(
+    directory: string,
+    pluginConfig: ResolvedPluginConfig,
+    hostFlavor?: string,
+  ): RuntimeConfig {
+    const instance = new RuntimeConfig(directory, hostFlavor);
+    instance.seedPlugin(pluginConfig);
     return instance;
   }
 
@@ -209,9 +209,24 @@ export class RuntimeConfig {
   static get(directory: string): RuntimeConfig {
     let instance = registry.get(directory);
     if (!instance) {
-      instance = new RuntimeConfig();
+      instance = new RuntimeConfig(directory);
       registry.set(directory, instance);
     }
+    return instance;
+  }
+
+  /**
+   * Build an UNREGISTERED instance from a plugin config. Used by read-only
+   * resolution paths (the v2 hot-profile refresh) that must not disturb the
+   * live per-directory singleton. Host override and runtime-preset state can
+   * be applied on the throwaway instance without any global side effect.
+   */
+  static create(
+    directory: string,
+    pluginConfig: ResolvedPluginConfig,
+  ): RuntimeConfig {
+    const instance = new RuntimeConfig(directory);
+    instance.seedPlugin(pluginConfig);
     return instance;
   }
 
@@ -220,13 +235,15 @@ export class RuntimeConfig {
     registry.delete(directory);
   }
 
-  private pluginConfig: PluginConfig | undefined;
+  private pluginConfig: ResolvedPluginConfig | undefined;
   private hostSnapshot: HostConfigSnapshot | undefined;
   private runtimePresetName: string | null = null;
   private switchedModels = new Set<string>();
+  private localSkillNamesCache: readonly string[] | undefined;
 
-  private seedPlugin(pluginConfig: PluginConfig): void {
+  private seedPlugin(pluginConfig: ResolvedPluginConfig): void {
     this.pluginConfig = deepFreeze(clonePlain(pluginConfig));
+    this.localSkillNamesCache = undefined;
   }
 
   /**
@@ -243,7 +260,7 @@ export class RuntimeConfig {
   // ---------------------------------------------------------------------
 
   /** Frozen snapshot of the plugin config as loaded at factory start. */
-  get plugin(): PluginConfig | undefined {
+  get plugin(): ResolvedPluginConfig | undefined {
     return this.pluginConfig;
   }
 
@@ -259,18 +276,20 @@ export class RuntimeConfig {
    * (not yet loader-merged) plugin config.
    */
   agents(): Record<string, AgentOverrideConfig> {
-    let base = this.pluginConfig?.agents ?? {};
+    let base = mergeAgentOverrides({}, this.pluginConfig?.agents ?? {});
     const filePreset = this.pluginConfig?.preset
-      ? this.pluginConfig.presets?.[this.pluginConfig.preset]
+      ? this.resolvedPresetAgents(this.pluginConfig.preset)
       : undefined;
     if (filePreset) {
       base = mergeAgentOverrides(filePreset, base);
     }
     const runtimePreset = this.runtimePresetAgents();
-    if (!runtimePreset) {
-      return base;
-    }
-    return mergeAgentOverrides(base, runtimePreset);
+    const merged = runtimePreset
+      ? mergeAgentOverrides(base, runtimePreset)
+      : base;
+    return resolveEffectiveAgentOverrides(merged, () =>
+      this.projectLocalSkillNames(),
+    );
   }
 
   /**
@@ -283,9 +302,15 @@ export class RuntimeConfig {
     if (!hostLayer) {
       return merged;
     }
+    const hostOverride =
+      merged?.model === undefined && merged?.inheritModelFrom !== undefined
+        ? Object.fromEntries(
+            Object.entries(hostLayer).filter(([key]) => key !== 'model'),
+          )
+        : hostLayer;
     return deepMerge(
       merged as Record<string, unknown> | undefined,
-      hostLayer as Record<string, unknown> | undefined,
+      hostOverride as Record<string, unknown> | undefined,
     ) as AgentOverrideConfig | undefined;
   }
 
@@ -312,6 +337,18 @@ export class RuntimeConfig {
   get disabledSkills(): readonly string[] {
     const value = this.pluginConfig?.disabled_skills;
     return Array.isArray(value) ? value : [];
+  }
+
+  /** Hook names disabled via config; empty when none are configured. */
+  get disabledHooks(): ReadonlySet<string> {
+    const value = this.pluginConfig?.disabled_hooks;
+    return new Set(Array.isArray(value) ? value : []);
+  }
+
+  /** Command names disabled via config; empty when none are configured. */
+  get disabledCommands(): ReadonlySet<string> {
+    const value = this.pluginConfig?.disabled_commands;
+    return new Set(Array.isArray(value) ? value : []);
   }
 
   /** Custom agent names declared in config.agents (was getCustomAgentNames). */
@@ -437,12 +474,35 @@ export class RuntimeConfig {
   }
 
   /**
+   * The dynamic model source of an agent that combines a fallback model
+   * chain (`model: [...]`) with `inheritModelFrom`, or undefined when the
+   * agent's model is fully static. Combined agents follow the live
+   * session/orchestrator model; the configured chain only serves as the
+   * failure fallback, so a runtime `/model` pick must not disable it.
+   * Reads the plugin-layer override (agents()), never the host layer, so a
+   * host-persisted scalar model cannot mask the configured array.
+   */
+  combinedModelInheritanceSource(
+    name: string,
+  ): 'session' | 'orchestrator' | undefined {
+    const override = this.aliasAwareOverride(this.agents(), name);
+    if (
+      !Array.isArray(override?.model) ||
+      override.model.length === 0 ||
+      override.inheritModelFrom === undefined
+    ) {
+      return undefined;
+    }
+    return override.inheritModelFrom;
+  }
+
+  /**
    * Primary model from the active preset (orchestrator model, else first
    * subagent model). Was getConfigPrimaryModel in src/agents/index.ts.
    */
   get primaryModel(): string | undefined {
     const activePreset = this.preset
-      ? this.pluginConfig?.presets?.[this.preset]
+      ? this.resolvedPresetAgents(this.preset)
       : undefined;
     if (!activePreset) {
       return undefined;
@@ -497,15 +557,35 @@ export class RuntimeConfig {
    * guard, mirrors the previous config-hook reset branch).
    */
   setRuntimePreset(name: string | null): void {
-    if (name && this.pluginConfig?.presets?.[name]) {
+    const presets = this.pluginConfig?.presets;
+    if (!name || !presets || !Object.hasOwn(presets, name)) {
+      this.runtimePresetName = null;
+      return;
+    }
+    try {
+      resolvePreset(name, presets);
       this.runtimePresetName = name;
-    } else {
+    } catch {
       this.runtimePresetName = null;
     }
   }
 
   getRuntimePreset(): string | null {
     return this.runtimePresetName;
+  }
+
+  /** Return the runtime override only when it resolves in this config snapshot. */
+  resolveRuntimePreset(
+    pluginConfig: ResolvedPluginConfig | undefined = this.pluginConfig,
+  ): string | null {
+    const name = this.runtimePresetName;
+    if (!name || !pluginConfig?.presets?.[name]) return null;
+    try {
+      resolvePreset(name, pluginConfig.presets);
+      return name;
+    } catch {
+      return null;
+    }
   }
 
   /** Record that an agent's model was switched at runtime. */
@@ -528,7 +608,36 @@ export class RuntimeConfig {
     if (!name) {
       return undefined;
     }
-    return this.pluginConfig?.presets?.[name];
+    return this.resolvedPresetAgents(name);
+  }
+
+  private resolvedPresetAgents(
+    name: string,
+  ): Record<string, AgentOverrideConfig> | undefined {
+    const presets = this.pluginConfig?.presets;
+    if (!presets || !Object.hasOwn(presets, name)) {
+      return undefined;
+    }
+    try {
+      return resolvePreset(name, presets);
+    } catch (error) {
+      // Loader warnings carry the detailed chain. Runtime can be initialized
+      // directly in tests or by embedders, so do not select a partial chain.
+      if (!(error instanceof PresetResolutionError)) {
+        throw error;
+      }
+      return undefined;
+    }
+  }
+
+  private projectLocalSkillNames(): readonly string[] {
+    if (this.localSkillNamesCache === undefined) {
+      this.localSkillNamesCache = discoverProjectLocalSkillNames(
+        this.directory,
+        this.hostFlavor,
+      );
+    }
+    return this.localSkillNamesCache;
   }
 
   /** Alias-aware override lookup inside a merged agents record. */

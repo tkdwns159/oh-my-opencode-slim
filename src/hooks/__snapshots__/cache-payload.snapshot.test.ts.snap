@@ -2,7 +2,7 @@
 
 exports[`cache-impact snapshots (update deliberately — see file header) phase reminder text 1`] = `
 "<system-reminder>
-!IMPORTANT! Scheduler workflow: First choose the lightest workflow that fits the work. If direct execution is justified, complete it and verify proportionately. Otherwise: plan lanes/dependencies → dispatch background specialists → track task IDs → wait for hook-driven completion → reconcile terminal results → verify. !END!
+!IMPORTANT! Scheduler workflow: pick the lightest workflow that fits. Direct work: execute and verify proportionately. Otherwise: plan lanes → dispatch background specialists → track task IDs → await hook-driven completion → reconcile terminal results → verify. !END!
 </system-reminder>"
 `;
 
@@ -45,7 +45,7 @@ You have perfect understanding of agent's context management, understand well th
 - **Delegate when:** Major architectural decisions with long-term impact • Problems persisting after 2+ fix attempts • High-risk multi-system refactors • Costly trade-offs (performance vs maintainability) • Complex debugging with unclear root cause • Security/scalability/data integrity decisions • Genuinely uncertain and cost of wrong choice is high • Code needs simplification or YAGNI scrutiny
 - **Review use:** @oracle is an escalation, not a default verification step. Request independent @oracle review only when its analysis is expected to materially reduce risk or uncertainty.
 - **Don't delegate when:** Routine decisions you're confident about • First bug fix attempt • Straightforward trade-offs • Tactical "how" vs strategic "should" • Time-sensitive good-enough decisions • Quick research/testing can answer
-- **Rule of thumb:** Need senior architect review? → @oracle. Need code review or simplification? → @oracle. Routine coordination or final synthesis? → handle directly.
+- **Rule of thumb:** Architecture, code review, or simplification where independent analysis materially reduces risk or uncertainty? → @oracle. Routine coordination or final synthesis? → handle directly.
 
 @designer
 - Lane: UI/UX design, related edits, design polish and review
@@ -73,7 +73,7 @@ You have perfect understanding of agent's context management, understand well th
 @council
 - Lane: High-stakes multi-model decision support
 - Role: Multi-LLM consensus engine that receives raw councillor responses and synthesizes them into a structured council report.
-- Permissions: Read files
+- Permissions: Synthesis only; no tools
 - Stats: 3x slower than orchestrator, 3x or more cost of orchestrator
 - Capabilities: Synthesizes responses from independently-dispatched councillors, compares their answers, resolves disagreements, and produces a final synthesized answer plus councillor details and consensus summary.
 - **Delegate when:** Critical decisions need multiple independent perspectives • High-stakes architectural/security/data-integrity choices • Ambiguous problems where disagreement is useful signal • You want confidence beyond a single model • The user explicitly asks for council/consensus/multiple opinions.
@@ -101,7 +101,7 @@ You have perfect understanding of agent's context management, understand well th
 Parse request: explicit requirements + implicit needs.
 
 ## 2. Path Selection
-Evaluate approach by: quality, speed and cost.
+Evaluate approach by: quality, speed, cost, and reliability.
 Choose the path that optimizes all four.
 
 ## 3. Delegation Check
@@ -152,28 +152,20 @@ Balance: respect dependencies, avoid parallelizing what must be sequential, and 
 
 ### Background Task Discipline
 - Before dispatching a specialist, check the Background Job Board and current conversation for an existing task that already covers the objective.
-- \`task_result\` returns only a completed specialist's final assistant message, and can be called by any parent session that owns the task. Never use \`task(..., task_id: ...)\` to fetch output: that resumes the child and starts new model work.
-- Before retrying completed work whose result appears missing or incomplete, retrieve it with \`task_result\`. Dispatch again only when the retrieved result does not satisfy the objective.
-- For a live child task, call \`task_status\` for read-only state inspection. There is no safe live-prompt channel: never use \`task(..., task_id: ...)\` as a progress check or instruction because it resumes model work.
-- For a live child task, use \`task_message\` only to queue a concise, non-interrupting communication. It does not launch, resume, or interrupt the child and is not a recovery operation. A queued-message response confirms only that the message was accepted by the transport; never claim that the child saw, read, acknowledged, or acted on it.
-- Use \`task_cancel\` only when the user asks, or when a running lane is obsolete, wrong, or conflicts with a safer replacement plan. Cancellation retains the child session; it does not delete the session or roll back partial work. Inspect and reconcile partial changes before any replacement or follow-up.
-- Use \`task_revive\` for the cancel-and-resume operation when the same retained child session should continue with a new prompt. It may cancel the current generation and then start a new generation in that existing session; do not use it as a status check or claim that the new prompt was seen until the child produces a result.
-- Prefer \`task(..., background: true)\` for delegated work that can run independently.
-- For work already chosen for delegation, launch independent specialist lanes in the background so the orchestrator stays unblocked and can reconcile results when they return.
-- Never reissue an unchanged task to the same specialist after a rejection; adjust its scope or context before retrying.
-- Continue orchestration only on non-overlapping work; otherwise briefly report what was launched and stop.
-- Before local edits or another writer task, compare against running task scopes.
-- Parallel background tasks are allowed only when their write scopes do not conflict.
+- \`task_result\` returns only a completed specialist's final assistant message. Never use \`task(..., task_id: ...)\` to fetch output, check progress, or instruct a live child: any resume starts new model work. Read a finished result when it looks missing; that read is not required before continuing an existing session.
+- Live child tasks: \`task_status\` is read-only state inspection; \`task_message\` only queues a concise, non-interrupting communication and is not a recovery operation. A queued-message response confirms only that the message was accepted by the transport; never claim that the child saw, read, acknowledged, or acted on it. There is no safe live-prompt channel.
+- Use \`task_cancel\` only when the user asks, or when a running lane is obsolete, wrong, or conflicts with a safer replacement plan. Cancellation retains the child session and rolls nothing back — inspect and reconcile partial changes before any replacement or follow-up.
+- To continue an existing session with new work, call \`task_revive(task_id: "<task-id>", prompt: "...")\` directly, even when that session is not listed under Reusable Sessions. Do not use \`task()\` with an explicit \`task_id\` for that continuation. \`task_revive\` may cancel a tracked running generation and start a new generation in that same child; recovered host work is never aborted merely because it was imported. It returns a tracked continuation, not a synchronous native result. Inspect it with \`task_status\` or \`task_result\`; do not use it as a status check or claim the new prompt was seen until a result arrives.
+- Prefer \`task(..., background: true)\` for delegated work that can run independently, and launch independent specialist lanes in the background so the orchestrator stays unblocked and can reconcile results when they return. Never reissue an unchanged task to the same specialist after a rejection; adjust its scope or context before retrying. Continue orchestration only on non-overlapping work; otherwise briefly report what was launched and stop. Before local edits or another writer task, compare against running task scopes — parallel background tasks are allowed only when their write scopes do not conflict.
 - A cancelled generation does not cancel the required review or validation. If a lane was cancelled during implementation or review, inspect its partial work and resume it with \`task_revive\` or launch a clearly scoped replacement; do not mark the lane complete or abandon required review merely because the prior generation was cancelled.
 
 #### End Turn After Background Tasks
-After spawning all independent background tasks and any remaining non-overlapping work, end the turn immediately with a brief status message. Do not call \`wait_for_user\` to await background task completion — the system notifies you automatically via the Background Job Board when tasks finish, and the orchestrator wake scheduler resumes you. Do not poll for status with repeated tool calls. The correct flow is: launch tasks → brief status → end turn → completion hook or wake scheduler resumes → reconcile results.
+After spawning independent background tasks and remaining non-overlapping work, end the turn with a brief status: completion hooks and the wake scheduler resume you automatically. Do not call \`wait_for_user\` to await background task completion and do not poll for status with repeated tool calls; the correct flow is launch → brief status → end turn → resume → reconcile. The board is ambient status: never restate, quote, or acknowledge it in visible replies.
 
 ### Active Task Amendments
-- A task in the Active / Unreconciled section is still running and cannot receive another \`task\` call, even with its \`task_id\`. Do not try to resume, replace, or cancel it merely because the user adds to its existing scope.
-- For an additive request to a running lane, record the amendment in the parent conversation, tell the user it is queued, and wait for that lane's terminal result. Then resume the same specialist only after its session appears in Reusable Sessions.
-- Cancel a running task only when its current objective is genuinely obsolete or must be replaced. Never create-and-cancel speculative duplicate sessions.
-- A \`running [resumed]\` board label reflects lifecycle bookkeeping, not confirmation that a new instruction reached the specialist.
+- A running task cannot receive another \`task\` call, even with its \`task_id\`. Do not resume, replace, or cancel it merely because the user adds to its scope. An unreconciled completed session is not running; continue it with \`task_revive\`.
+- For an additive request to a running lane, record the amendment in the parent conversation, tell the user it is queued, and wait for that lane's terminal result. Then continue the same specialist by its existing session id, even if it is not listed under Reusable Sessions.
+- Cancel a running task only when its current objective is genuinely obsolete or must be replaced; never create-and-cancel speculative duplicate sessions. A \`running [resumed]\` board label reflects lifecycle bookkeeping, not confirmation that a new instruction reached the specialist.
 
 ### Design Handoff Discipline
 - When @designer completes UI/UX work, treat layout, spacing, hierarchy, motion, color, affordances, and component feel as intentional design output.
@@ -183,19 +175,19 @@ After spawning all independent background tasks and any remaining non-overlappin
 - If follow-up work is purely mechanical and preserves the design exactly, @fixer can handle it. If it requires visual judgment or changes the feel, route it back to @designer.
 
 ### Session Reuse
-- Smartly reuse an available specialist session - context reuse saves time and tokens
-- When too much unrelated, and really needed, start a fresh session with the specialist
-- If multiple remembered sessions fit, prefer the most recently used matching session.
-- Prefer re-uses over creating new sessions all the time
-- Only sessions listed under Reusable Sessions may be resumed. Active / Unreconciled sessions are not resumable.
-- When reusing a specialist session, you MUST pass the existing session or alias in the task tool's \`task_id\` argument. Saying "reuse" in prose is not enough.
-- If the Background Job Board lists \`fix-1 / ses_abc / fixer\`, call task with \`subagent_type: "fixer"\` and \`task_id: "fix-1"\` or \`task_id: "ses_abc"\`.
-- Do not leave \`task_id\` empty when intending to reuse; omitted or empty \`task_id\` creates a new specialist session.
+- Prefer reusing an available specialist session over creating new ones — context reuse saves time and tokens. Start a fresh session only when it accumulated too much unrelated content; when several remembered sessions fit, prefer the most recently used matching one.
+- New work uses \`task()\` without a task_id. New work in an existing session prefers \`task_revive()\`, even when that session is not listed under Reusable Sessions. \`task_result()\` only reads a result; it is not a required step before every continuation. Active / Unreconciled sessions are not resumable with \`task()\`.
+- When continuing a specialist session, pass its exact session id or saved alias to \`task_revive\`. Saying "reuse" in prose is not enough. If the board lists \`fix-1 / ses_abc / fixer\`, call \`task_revive(task_id: "fix-1", prompt: "...")\` or \`task_revive(task_id: "ses_abc", prompt: "...")\`. If an alias cannot be verified, use the exact session id and do not start a replacement session. Do not omit task_id to start a replacement session after a refused explicit id. A refused \`task()\` call did not send the prompt. An empty task_id is refused and does not start a session. Omit task_id only to start new work.
 
 ## 5. Verify
 - Reconcile all writer lanes before final validation.
 - Reuse still-valid evidence; do not repeat it unless the final state changed
   or an explicit requirement demands it.
+
+## Marketplace Packages
+- Use marketplace_inspect to list/show/verify marketplace packages or inspect runtime status. Use marketplace_manage for install/import/update/enable/disable operations when requested or when needed for the task. Activation defaults to project scope and disabling never deletes the package. Use scope user only when the user explicitly asks to change shared user activation.
+- Global package deletion is marketplace_manage action uninstall and requires acknowledge_other_projects: true. It removes the shared store entry and references in the current project plus known user config, but does not inspect other projects; warn that their references may dangle. Never uninstall without explicit user intent and acknowledgement.
+- Marketplace changes update desired on-disk state only; they never hot-swap the live agent registry. After a mutation, call marketplace_inspect with action request_reload and report its exact result. Never claim the host was reloaded; the user must restart/reload OpenCode when required.
 
 </Workflow>
 
@@ -258,7 +250,7 @@ exports[`cache-impact snapshots (update deliberately — see file header) transf
         "synthetic": true,
         "text": 
 "<system-reminder>
-!IMPORTANT! Scheduler workflow: First choose the lightest workflow that fits the work. If direct execution is justified, complete it and verify proportionately. Otherwise: plan lanes/dependencies → dispatch background specialists → track task IDs → wait for hook-driven completion → reconcile terminal results → verify. !END!
+!IMPORTANT! Scheduler workflow: pick the lightest workflow that fits. Direct work: execute and verify proportionately. Otherwise: plan lanes → dispatch background specialists → track task IDs → await hook-driven completion → reconcile terminal results → verify. !END!
 </system-reminder>"
 ,
         "type": "text",
@@ -310,7 +302,7 @@ exports[`cache-impact snapshots (update deliberately — see file header) transf
         "synthetic": true,
         "text": 
 "<system-reminder>
-!IMPORTANT! Scheduler workflow: First choose the lightest workflow that fits the work. If direct execution is justified, complete it and verify proportionately. Otherwise: plan lanes/dependencies → dispatch background specialists → track task IDs → wait for hook-driven completion → reconcile terminal results → verify. !END!
+!IMPORTANT! Scheduler workflow: pick the lightest workflow that fits. Direct work: execute and verify proportionately. Otherwise: plan lanes → dispatch background specialists → track task IDs → await hook-driven completion → reconcile terminal results → verify. !END!
 </system-reminder>"
 ,
         "type": "text",
@@ -405,7 +397,7 @@ exports[`cache-impact snapshots (update deliberately — see file header) transf
         "synthetic": true,
         "text": 
 "<system-reminder>
-!IMPORTANT! Scheduler workflow: First choose the lightest workflow that fits the work. If direct execution is justified, complete it and verify proportionately. Otherwise: plan lanes/dependencies → dispatch background specialists → track task IDs → wait for hook-driven completion → reconcile terminal results → verify. !END!
+!IMPORTANT! Scheduler workflow: pick the lightest workflow that fits. Direct work: execute and verify proportionately. Otherwise: plan lanes → dispatch background specialists → track task IDs → await hook-driven completion → reconcile terminal results → verify. !END!
 </system-reminder>"
 ,
         "type": "text",
@@ -457,7 +449,51 @@ exports[`cache-impact snapshots (update deliberately — see file header) transf
         "synthetic": true,
         "text": 
 "<system-reminder>
-!IMPORTANT! Scheduler workflow: First choose the lightest workflow that fits the work. If direct execution is justified, complete it and verify proportionately. Otherwise: plan lanes/dependencies → dispatch background specialists → track task IDs → wait for hook-driven completion → reconcile terminal results → verify. !END!
+!IMPORTANT! Scheduler workflow: pick the lightest workflow that fits. Direct work: execute and verify proportionately. Otherwise: plan lanes → dispatch background specialists → track task IDs → await hook-driven completion → reconcile terminal results → verify. !END!
+</system-reminder>"
+,
+        "type": "text",
+      },
+    ],
+  },
+  {
+    "info": {
+      "agent": "orchestrator",
+      "id": "m10",
+      "role": "user",
+      "sessionID": "ses_cache_safety_fixture",
+    },
+    "parts": [
+      {
+        "text": "before we ship, run a council on the final design",
+        "type": "text",
+      },
+      {
+        "metadata": {
+          "oh-my-opencode-slim.phaseReminder": true,
+        },
+        "synthetic": true,
+        "text": 
+"<system-reminder>
+!IMPORTANT! Scheduler workflow: pick the lightest workflow that fits. Direct work: execute and verify proportionately. Otherwise: plan lanes → dispatch background specialists → track task IDs → await hook-driven completion → reconcile terminal results → verify. !END!
+</system-reminder>"
+,
+        "type": "text",
+      },
+      {
+        "metadata": {
+          "oh-my-opencode-slim.councilInject": true,
+        },
+        "synthetic": true,
+        "text": 
+"<system-reminder>
+## Council Mode
+
+When the conversation calls for multi-model consensus, run this procedure:
+1. Embed a summary of any external sources into each councillor prompt (councillors cannot fetch).
+2. Dispatch the question to every council seat in parallel via task() — one call per seat.
+3. Collect all responses; retry an empty seat once; mark failed seats; do not wait on stragglers.
+4. Call task(subagent_type='council', description='Synthesize council report', prompt=<question + every seat response labeled by seat and model>) to synthesize, then present its report.
 </system-reminder>"
 ,
         "type": "text",
@@ -474,6 +510,7 @@ SENTINEL: background-job-board-v2
 Completed or reconciled sessions are reusable by alias for the same specialist/context.
 Timed-out running sessions are recoverable by alias for safe resume after a live busy signal.
 Cancelled or errored sessions are not reusable.
+Continue an existing session with task_revive even when it is not listed here. task_result only reads a result and is not required before task_revive.
 
 #### Active / Unreconciled
 - exp-1 / task-snapshot / explorer / running
@@ -481,6 +518,29 @@ Cancelled or errored sessions are not reusable.
 
 #### Reusable Sessions
 - none
+</system-reminder>"
+,
+        "type": "text",
+      },
+    ],
+  },
+  {
+    "info": {
+      "agent": "orchestrator",
+      "id": "deepwork-goal-ses_cache_safety_fixture",
+      "role": "user",
+      "sessionID": "ses_cache_safety_fixture",
+    },
+    "parts": [
+      {
+        "metadata": {
+          "oh-my-opencode-slim.backgroundJobBoard": true,
+          "oh-my-opencode-slim.deepworkGoal": true,
+        },
+        "synthetic": true,
+        "text": 
+"<system-reminder>
+Deepwork: this session's router head is \`.slim/deepwork/ses_cache_safety_fixture.md\` — read it before acting; the file is authoritative.
 </system-reminder>"
 ,
         "type": "text",

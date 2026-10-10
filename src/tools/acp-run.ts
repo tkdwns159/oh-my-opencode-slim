@@ -10,6 +10,11 @@ import {
 
 const z = tool.schema;
 
+const ACP_CANCEL_FLUSH_MS = 250;
+const ACP_GRACEFUL_EXIT_MS = 1_000;
+const ACP_TERMINATE_EXIT_MS = 1_000;
+const ACP_KILL_EXIT_MS = 500;
+
 type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 
 interface RpcResponse {
@@ -47,15 +52,22 @@ export function createAcpInitializeParams() {
 
 class AcpClient {
   private child: ChildProcessWithoutNullStreams;
+  private exitPromise: Promise<void>;
+  private closePromise: Promise<void> | undefined;
+  private closing = new AbortController();
+  private childTerminated = false;
   private next = 1;
   private pending = new Map<number, Pending>();
   private chunks: string[] = [];
   private errors: string[] = [];
+  private progress = new Map<string, string>();
   private sessionId: string | undefined;
   private lastUpdate = Date.now();
   private authMethods: Array<Record<string, unknown>> = [];
   private active = false;
   private activeRequests = 0;
+  /** True once run() returned or the client was closed: late session/update arrivals are ignored. */
+  private settled = false;
 
   constructor(
     private name: string,
@@ -65,11 +77,30 @@ class AcpClient {
       title: string,
       metadata: Record<string, unknown>,
     ) => Promise<void>,
+    /**
+     * Live progress sink (tool part metadata). Called on every tool_call,
+     * tool_call_update, and plan session/update so the parent TUI can show
+     * what the external agent is doing while it works.
+     */
+    private report?: (title: string, metadata: Record<string, unknown>) => void,
   ) {
     this.child = spawn(config.command, config.args, {
       cwd,
       env: { ...process.env, ...config.env },
       stdio: 'pipe',
+      // Console-subsystem agents would otherwise show a console window for
+      // the whole agent run on GUI hosts.
+      windowsHide: true,
+    });
+    this.exitPromise = new Promise((resolve) => {
+      const settle = () => {
+        this.child.off('exit', settle);
+        this.child.off('close', settle);
+        this.childTerminated = true;
+        resolve();
+      };
+      this.child.once('exit', settle);
+      this.child.once('close', settle);
     });
     this.child.stderr.on('data', (chunk) => {
       this.errors.push(String(chunk));
@@ -110,9 +141,9 @@ class AcpClient {
     });
     await this.drain();
     this.active = false;
+    this.settled = true;
     return this.output();
   }
-
   private async newSession(): Promise<Json | undefined> {
     try {
       return await this.request('session/new', {
@@ -130,12 +161,63 @@ class AcpClient {
       });
     }
   }
+  close(): Promise<void> {
+    this.settled = true;
+    this.closing.abort();
+    this.closePromise ??= this.shutdown();
+    return this.closePromise;
+  }
 
-  close(): void {
-    if (this.active && this.sessionId && !this.child.killed) {
-      this.notify('session/cancel', { sessionId: this.sessionId });
+  private async shutdown(): Promise<void> {
+    if (this.hasExited()) return;
+
+    if (this.active && this.sessionId) {
+      await this.withTimeout(
+        this.notify('session/cancel', { sessionId: this.sessionId }),
+        ACP_CANCEL_FLUSH_MS,
+      );
     }
-    if (!this.child.killed) this.child.kill('SIGTERM');
+
+    if (!this.hasExited()) this.child.stdin.end();
+    if (await this.waitForExit(ACP_GRACEFUL_EXIT_MS)) return;
+
+    this.child.kill('SIGTERM');
+    if (await this.waitForExit(ACP_TERMINATE_EXIT_MS)) return;
+
+    this.child.kill('SIGKILL');
+    await this.waitForExit(ACP_KILL_EXIT_MS);
+  }
+
+  private hasExited(): boolean {
+    return (
+      this.childTerminated ||
+      this.child.exitCode !== null ||
+      this.child.signalCode !== null
+    );
+  }
+
+  private async waitForExit(timeoutMs: number): Promise<boolean> {
+    if (this.hasExited()) return true;
+    return await this.withTimeout(this.exitPromise, timeoutMs);
+  }
+
+  private async withTimeout(
+    promise: Promise<void>,
+    timeoutMs: number,
+  ): Promise<boolean> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        promise.then(() => true),
+        new Promise<boolean>((resolve) => {
+          timer = setTimeout(() => resolve(false), timeoutMs);
+        }),
+      ]);
+    } catch {
+      return false;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   private request(
@@ -154,10 +236,16 @@ class AcpClient {
     });
   }
 
-  private notify(method: string, params: Record<string, unknown>): void {
-    this.child.stdin.write(
-      `${JSON.stringify({ jsonrpc: '2.0', method, params })}\n`,
-    );
+  private notify(
+    method: string,
+    params: Record<string, unknown>,
+  ): Promise<void> {
+    return new Promise((resolve, reject) => {
+      this.child.stdin.write(
+        `${JSON.stringify({ jsonrpc: '2.0', method, params })}\n`,
+        (error) => (error ? reject(error) : resolve()),
+      );
+    });
   }
 
   private async drain(): Promise<void> {
@@ -178,7 +266,7 @@ class AcpClient {
       );
       this.errors.push(error.message);
       this.rejectPending(error);
-      this.close();
+      void this.close();
       return;
     }
     if ('id' in message && ('result' in message || 'error' in message)) {
@@ -215,7 +303,11 @@ class AcpClient {
       const title = readPermissionTitle(message.params);
       try {
         if (this.config.permissionMode === 'ask') {
-          await this.ask(title, message.params ?? {});
+          const answered = await this.askBeforeClose(
+            title,
+            message.params ?? {},
+          );
+          if (!answered) return;
         }
         const optionId = selectPermissionOption(
           message.params,
@@ -244,12 +336,42 @@ class AcpClient {
     );
   }
 
+  private async askBeforeClose(
+    title: string,
+    metadata: Record<string, unknown>,
+  ): Promise<boolean> {
+    if (this.closing.signal.aborted) return false;
+    return await new Promise<boolean>((resolve, reject) => {
+      const onAbort = () => {
+        this.closing.signal.removeEventListener('abort', onAbort);
+        resolve(false);
+      };
+      this.closing.signal.addEventListener('abort', onAbort, { once: true });
+      this.ask(title, metadata).then(
+        () => {
+          this.closing.signal.removeEventListener('abort', onAbort);
+          resolve(true);
+        },
+        (error) => {
+          this.closing.signal.removeEventListener('abort', onAbort);
+          reject(error);
+        },
+      );
+    });
+  }
   private handleNotification(message: RpcNotification): void {
-    if (message.method !== 'session/update') return;
+    if (message.method !== 'session/update' || this.settled) return;
     this.lastUpdate = Date.now();
     const update = message.params?.update;
     if (!isRecord(update)) return;
     collectText(update, this.chunks);
+    const rendered = trackProgress(update, this.progress);
+    if (!rendered) return;
+    try {
+      this.report?.(rendered.title, { progress: rendered.progress });
+    } catch {
+      // A host-side metadata failure must not poison the ACP loop.
+    }
   }
 
   private reply(id: number, result: Json): void {
@@ -335,6 +457,7 @@ export function createAcpRunTool(agents: AcpAgentsConfig = {}): ToolDefinition {
             metadata,
           });
         },
+        (title, metadata) => ctx.metadata({ title, metadata }),
       );
       const timeoutMs = args.timeout_ms ?? config.timeoutMs;
       let timer: ReturnType<typeof setTimeout> | undefined;
@@ -353,7 +476,9 @@ export function createAcpRunTool(agents: AcpAgentsConfig = {}): ToolDefinition {
                 )),
             )
           : undefined;
-      const abort = () => client.close();
+      const abort = () => {
+        void client.close();
+      };
       ctx.abort.addEventListener('abort', abort, { once: true });
       try {
         const run = client.run(args.prompt);
@@ -361,7 +486,7 @@ export function createAcpRunTool(agents: AcpAgentsConfig = {}): ToolDefinition {
       } finally {
         if (timer) clearTimeout(timer);
         ctx.abort.removeEventListener('abort', abort);
-        client.close();
+        await client.close();
       }
     },
   });
@@ -437,6 +562,80 @@ function collectText(update: Record<string, unknown>, chunks: string[]): void {
   if (update.sessionUpdate !== 'agent_message_chunk') return;
   const text = readText(update.delta) ?? readText(update.content);
   if (text) chunks.push(text);
+}
+
+const PROGRESS_GLYPHS: Record<string, string> = {
+  pending: '○',
+  in_progress: '▸',
+  completed: '✓',
+  failed: '✗',
+};
+/** Rolling progress cap: drop the oldest tracked call beyond this. */
+const PROGRESS_CAP = 40;
+/** How many recent progress lines the TUI metadata carries. */
+const PROGRESS_TAIL = 20;
+
+/**
+ * Fold one ACP session/update into the rolling progress log and render the
+ * latest view. tool_call/tool_call_update are keyed by toolCallId (later
+ * updates replace earlier state); plan replaces as a block. Returns the
+ * tail for the TUI plus its last line as a compact title.
+ */
+export function trackProgress(
+  update: Record<string, unknown>,
+  progress: Map<string, string>,
+): { title: string; progress: string } | undefined {
+  const kind = update.sessionUpdate;
+  let key: string | undefined;
+  let line: string | undefined;
+  if (kind === 'tool_call' || kind === 'tool_call_update') {
+    if (typeof update.toolCallId !== 'string') return undefined;
+    key = update.toolCallId;
+    const status = typeof update.status === 'string' ? update.status : '';
+    const glyph = PROGRESS_GLYPHS[status] ?? '·';
+    // tool_call_update may omit title (status-only): keep the human-readable
+    // label already rendered for this toolCallId instead of degrading to the
+    // opaque id.
+    const previousLine = progress.get(key);
+    const previousTitle = previousLine?.slice(previousLine.indexOf(' ') + 1);
+    const title =
+      typeof update.title === 'string' ? update.title : (previousTitle ?? key);
+    line = `${glyph} ${title}`;
+  } else if (kind === 'plan') {
+    const entries = Array.isArray(update.entries) ? update.entries : [];
+    const lines = entries
+      .filter(
+        (entry): entry is Record<string, unknown> & { content: string } =>
+          isRecord(entry) &&
+          typeof entry.content === 'string' &&
+          entry.content.length > 0,
+      )
+      .map((entry) => {
+        const status = typeof entry.status === 'string' ? entry.status : '';
+        const glyph = PROGRESS_GLYPHS[status] ?? '·';
+        return `${glyph} ${entry.content}`.trimEnd();
+      });
+    if (lines.length === 0) return undefined;
+    key = 'plan';
+    line = lines.join('\n');
+  }
+  if (!key || !line) return undefined;
+  if (!progress.has(key) && progress.size >= PROGRESS_CAP) {
+    const oldest = progress.keys().next().value;
+    if (oldest !== undefined) progress.delete(oldest);
+  }
+  // Re-set so an updated call lands at the newest tail position; otherwise
+  // a late completion of an old call stays outside the visible tail.
+  progress.delete(key);
+  progress.set(key, line);
+  const tail = [...progress.values()]
+    .join('\n')
+    .split('\n')
+    .slice(-PROGRESS_TAIL)
+    .join('\n');
+  const lastBreak = tail.lastIndexOf('\n');
+  const title = lastBreak === -1 ? tail : tail.slice(lastBreak + 1);
+  return { title, progress: tail };
 }
 
 function readText(value: unknown): string | undefined {

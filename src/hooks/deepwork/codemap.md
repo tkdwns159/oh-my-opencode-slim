@@ -7,7 +7,6 @@ Provides an OpenCode hook implementation for managing deepwork sessions - heavy,
 This hook enables developers to:
 - Initiate deepwork sessions via `/deepwork <task>` command
 - Maintain `.slim/deepwork/` progress tracking files
-- Keep OpenCode todos synchronized with current phase
 - Enforce phased implementation with `@oracle` review gates
 - Execute phases with background specialist agents where appropriate
 - Validate results and incorporate simplification/readability feedback
@@ -49,22 +48,22 @@ The hook follows the OpenCode plugin hook pattern, exposing a factory function `
    - Prompts user: "What task should deepwork manage? Run `/deepwork <task>`."
 5. If task provided:
    - Clears existing output parts (`output.parts.length = 0`)
-   - Generates activation prompt via `activationPrompt(task)`
+   - Generates activation prompt via `activationPrompt(task, sessionID)`
    - Injects activation prompt into output parts
-   - Prompt instructs agents to use deepwork skill with specific requirements
+   - Prompt = bundled SKILL.md body (single contract source, build-time text
+     import) + pinned router-head path + task
 
 ### Deepwork Session Execution
-1. Agent receives activation prompt with task description
-2. Agent creates `.slim/deepwork/` progress file
-3. Agent maintains OpenCode todo synchronization
-4. Agent drafts plan and requests `@oracle` review
-5. Agent creates and reviews phased implementation/delegation plan
-6. Agent executes phases with background specialists as needed
-7. Agent waits for hook-driven background completion
-8. Agent reconciles results and validates
-9. Agent requests `@oracle` review for each phase
-10. Agent incorporates simplification/readability feedback
-11. Agent fixes actionable review issues before continuing
+1. Agent receives the full workflow instructions (SKILL.md body) with the pinned router-head path and task
+2. Agent creates its `.slim/deepwork/<session-id>.md` router head and the task directory it points to
+3. Agent drafts plan and requests `@oracle` review
+4. Agent creates and reviews phased implementation/delegation plan
+5. Agent executes phases with background specialists as needed
+6. Agent waits for hook-driven background completion
+7. Agent reconciles results and validates
+8. Agent requests `@oracle` review for each phase
+9. Agent incorporates simplification/readability feedback
+10. Agent fixes actionable review issues before continuing
 
 ## Integration
 
@@ -93,12 +92,11 @@ The hook follows the OpenCode plugin hook pattern, exposing a factory function `
 ```
 
 ### File System
-- Creates progress tracking: `.slim/deepwork/<session-id>/` directory and files
-- Maintains synchronization with OpenCode todos
+- Router head: `.slim/deepwork/<session-id>.md`, path pinned by the activation prompt; task state lives in `.slim/deepwork/<task-slug>/progress.md`
 
 
 ### Hook Contract
 - **Input**: `{ command: string, sessionID: string, arguments: string }`
 - **Output**: `{ parts: Array<{ type: string, text?: string }> }`
-- **Side effects**: Modifies output parts array, may create progress files
+- **Side effects**: Modifies output parts array
 - **Validation**: Validates task presence, validates command name

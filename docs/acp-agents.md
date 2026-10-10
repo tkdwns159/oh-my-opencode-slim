@@ -33,7 +33,7 @@ project-local `.opencode/oh-my-opencode-slim.jsonc` file:
       "command": "claude-code-acp",
       "args": [],
       "description": "Claude Code subscription agent for deep research",
-      "wrapperModel": "openai/gpt-5.6-luna",
+      "wrapperModel": "openai/gpt-6-luna",
       "permissionMode": "ask",
       "timeoutMs": 300000
     },
@@ -87,6 +87,14 @@ claude /login
 ```
 
 Use the command required by your ACP server.
+
+## Progress visibility
+
+While the external agent works, `acp_run` streams ACP progress into the
+parent TUI as live tool metadata: tool calls (`tool_call` /
+`tool_call_update`) render as `▸ Title` / `✓ Title` lines, and plan updates
+render as plan blocks. The tool result itself stays the agent's final
+message.
 
 ## Safety notes
 
